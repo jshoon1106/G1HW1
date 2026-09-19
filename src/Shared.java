@@ -2,11 +2,13 @@ import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.UncheckedIOException;
-import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.HashMap;
 import java.util.Locale;
+import java.util.Map;
 
 class Task implements Comparable<Task> {
     final String id;
@@ -26,11 +28,6 @@ class Task implements Comparable<Task> {
         this.enqueuedAt = enqueuedAt;
     }
 
-    // 재시도 작업 복제
-    Task retryCopy() {
-        return new Task(id, key, value, attempts + 1, true, enqueuedAt);
-    }
-
     // TCP 전송 문자열 생성
     String wire() {
         return id + "," + key + "," + value + "," + attempts + "," + retry + "," + enqueuedAt;
@@ -38,9 +35,21 @@ class Task implements Comparable<Task> {
 
     // TCP 문자열 작업 복원
     static Task fromWire(String text) {
-        String[] p = text.split(",");
-        return new Task(p[0], p[1], Integer.parseInt(p[2]), Integer.parseInt(p[3]),
-                Boolean.parseBoolean(p[4]), Long.parseLong(p[5]));
+        String[] p = text.split(",", -1);
+        if (p.length != 6) throw new IllegalArgumentException("Task 필드 수 오류");
+        if (!p[0].matches("\\d{4}")) throw new IllegalArgumentException("Task ID 형식 오류");
+        if (!p[1].matches("[0-9a-fA-F]{4}")) throw new IllegalArgumentException("Key 형식 오류");
+        int value = Integer.parseInt(p[2]);
+        int attempts = Integer.parseInt(p[3]);
+        if (value < 1 || value > 100) throw new IllegalArgumentException("Value 범위 오류");
+        if (attempts < 0) throw new IllegalArgumentException("시도 횟수 범위 오류");
+        if (!"true".equals(p[4]) && !"false".equals(p[4])) {
+            throw new IllegalArgumentException("재시도 플래그 오류");
+        }
+        long enqueuedAt = Long.parseLong(p[5]);
+        if (enqueuedAt < 0) throw new IllegalArgumentException("가상 시각 범위 오류");
+        return new Task(p[0], p[1].toLowerCase(Locale.ROOT), value, attempts,
+                Boolean.parseBoolean(p[4]), enqueuedAt);
     }
 
     // 재시도 횟수 기준 우선순위 비교
@@ -76,8 +85,9 @@ class EventLogger implements AutoCloseable {
 
     // 로그 파일 생성
     EventLogger(String filename) throws IOException {
-        writer = Files.newBufferedWriter(Path.of(filename), StandardOpenOption.CREATE,
-                StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+        writer = Files.newBufferedWriter(Path.of(filename), StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.WRITE);
     }
 
     // 공통 형식 로그 기록
@@ -121,23 +131,26 @@ class EventLogger implements AutoCloseable {
 
 class WorkerInfo {
     final int id;
-    final int peerPort;
-    final Socket socket;
     final PrintWriter out;
     int queueSize;
     int success;
     int fail;
+    int queueRejects;
     int processed;
     int p2pSent;
     int p2pReceived;
+    int p2pSentEvents;
+    int p2pReceivedEvents;
+    int retryReceived;
+    double totalWait;
+    final Map<String, Integer> taskAttempts = new HashMap<>();
     boolean connected = true;
     boolean logRequested;
+    boolean terminationAcked;
 
     // Worker 연결 정보 생성
-    WorkerInfo(int id, int peerPort, Socket socket, PrintWriter out) {
+    WorkerInfo(int id, PrintWriter out) {
         this.id = id;
-        this.peerPort = peerPort;
-        this.socket = socket;
         this.out = out;
     }
 
@@ -153,11 +166,13 @@ class PendingResult {
     final boolean success;
     final double duration;
     final double wait;
+    final String reason;
 
-    PendingResult(Task task, boolean success, double duration, double wait) {
+    PendingResult(Task task, boolean success, double duration, double wait, String reason) {
         this.task = task;
         this.success = success;
         this.duration = duration;
         this.wait = wait;
+        this.reason = reason;
     }
 }

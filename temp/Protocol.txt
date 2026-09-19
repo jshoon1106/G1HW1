@@ -33,11 +33,11 @@ Worker 등록 요청
 STATUS|queueSize
 현재 Ready Queue 크기 보고
 
-RESULT|taskId|SUCCESS/FAIL|duration|wait|queueSize
-작업 처리 결과 보고
+RESULT|taskId|attempt|SUCCESS/FAIL|duration|wait|queueSize|PROCESS/QUEUE_FULL
+작업 처리 결과 보고. 처리 실패와 Queue 초과 거부를 구분한다.
 
-P2P|SENT/RECEIVED|peerId|count|taskIds
-P2P 작업 전송 또는 수신 결과 보고
+P2P|SENT/RECEIVED|peerId|transferId|count|taskRefs
+P2P 작업 전송 또는 수신 결과 보고. taskRefs 형식은 taskId:attempt 목록이다.
 
 TERMINATE_ACK
 종료 완료 응답
@@ -50,33 +50,44 @@ Worker 등록 완료 및 Master 가상 시각 전달
 TASK|id,key,value,attempts,retry,enqueuedAt
 작업 배정
 
-RESULT_ACK|taskId|SUCCESS/FAIL|masterClockMillis
+START|masterClockMillis
+초기 Queue 배정 완료 후 Worker 처리 Thread 시작 신호
+
+RESULT_ACK|taskId|attempt|SUCCESS/FAIL|masterClockMillis
 처리 결과 확인 및 확정 가상 시각 전달
 
-P2P_ACK|SENT/RECEIVED|peerId|count|taskIds|masterClockMillis
+P2P_ACK|SENT/RECEIVED|peerId|transferId|count|taskRefs|masterClockMillis
 P2P 결과 확인 및 확정 가상 시각 전달
 
-TERMINATE|masterClockMillis
-정상 종료 요청 및 최종 가상 시각 전달
+TERMINATE|masterClockMillis|faultReassignments|p2pEvents
+정상 종료 요청과 최종 가상 시각, 전체 장애 재할당 수, 전체 P2P 이전 이벤트 수 전달
 
 REJECT|reason
 Worker 등록 거부
 
 4. Worker - Worker P2P 메시지
 
-TRANSFER|sourceWorkerId|task1;task2;...
-인접 Worker 작업 이전 요청
+QUEUE_QUERY|requestId|sourceWorkerId
+대상 Worker의 현재 Ready Queue 크기 조회
 
-ACK
+QUEUE_STATUS|requestId|workerId|queueSize
+Queue 조회 응답. queueSize 범위는 0~10이다.
+
+TRANSFER|transferId|sourceWorkerId|task1;task2;...
+최소 Queue Worker 작업 이전 요청. transferId는 재전송 중복 수신을 방지한다.
+
+ACK|transferId
 작업 수신 완료
 
-REJECT
+REJECT|reason
 Queue 여유 공간 부족 또는 이전 거부
 
 5. 메시지 예시
 
 HELLO|1|6001
 TASK|0001,a3f7,83,0,false,1000
-RESULT|0001|SUCCESS|2.14|0.50|3
-P2P|SENT|2|3|KV[0088],KV[0089],KV[0090]
-TRANSFER|1|0088,b7c2,21,0,false,8000;0089,c2b5,55,0,false,8000
+RESULT|0001|0|SUCCESS|2.14|0.50|3|PROCESS
+P2P|SENT|2|1-17|3|0088:0,0089:0,0090:0
+QUEUE_QUERY|Q1-17|1
+QUEUE_STATUS|Q1-17|2|3
+TRANSFER|1-17|1|0088,b7c2,21,0,false,8000;0089,c2b5,55,0,false,8000

@@ -2,9 +2,13 @@ import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
@@ -12,6 +16,7 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
@@ -19,6 +24,9 @@ import java.util.concurrent.TimeUnit;
 
 class WorkerNode implements Runnable {
     private static final int QUEUE_LIMIT = 10;
+    private static final int CONNECT_TIMEOUT_MILLIS = 10_000;
+    private static final int SOCKET_TIMEOUT_MILLIS = 120_000;
+    private static final int P2P_TIMEOUT_MILLIS = 5_000;
     private final int id;
     private final String masterHost;
     private final int masterPort;
@@ -26,21 +34,32 @@ class WorkerNode implements Runnable {
     private final Object queueLock = new Object();
     private final Deque<Task> queue = new ArrayDeque<>();
     private final Map<String, PendingResult> pendingResults = new ConcurrentHashMap<>();
+    private final Set<String> acceptedTransferIds = ConcurrentHashMap.newKeySet();
     private final ByteArrayOutputStream masterLogBytes = new ByteArrayOutputStream();
     private final CountDownLatch masterLogReceived = new CountDownLatch(1);
-    private boolean stopping;
-    private long masterClockMillis;
+    private volatile boolean stopping;
+    private boolean processingEnabled;
+    private volatile long masterClockMillis;
     private long workerAvailableAt;
     private long nextLoadCheck;
+    private int reservedTransferSlots;
     private PrintWriter masterOut;
     private EventLogger log;
     private int success;
     private int fail;
+    private int queueRejects;
     private int processed;
     private int received;
     private int p2pSent;
     private int p2pReceived;
+    private int p2pSentEvents;
+    private int p2pReceivedEvents;
+    private int retryReceived;
+    private int masterReassignments;
+    private int masterP2pEvents;
     private double totalWait;
+    private long transferSequence;
+    private long querySequence;
 
     // Worker 실행 정보 설정
     WorkerNode(int id, String masterHost, int masterPort, int peerPort) {
@@ -70,9 +89,13 @@ class WorkerNode implements Runnable {
             log.header("Worker" + id + ".txt (Worker Node " + id + " Log)",
                     "Worker" + id + " | Thread-based Worker | Ready Queue max=10");
             writeAt(0, "INIT", "INFO", "워커 Thread 시작, 마스터 연결 시도");
-            try (Socket socket = new Socket(masterHost, masterPort)) {
+            try (Socket socket = new Socket()) {
+                socket.connect(new InetSocketAddress(masterHost, masterPort), CONNECT_TIMEOUT_MILLIS);
+                socket.setKeepAlive(true);
+                socket.setSoTimeout(SOCKET_TIMEOUT_MILLIS);
                 startPeerListener();
-                masterOut = new PrintWriter(socket.getOutputStream(), true);
+                masterOut = new PrintWriter(new OutputStreamWriter(
+                        socket.getOutputStream(), StandardCharsets.UTF_8), true);
                 sendMaster("HELLO|" + id + "|" + peerPort);
                 Thread receiver = new Thread(() -> receiveMaster(socket),
                         "worker-master-reader-" + id);
@@ -91,35 +114,77 @@ class WorkerNode implements Runnable {
 
     // Master 메시지 반복 수신
     private void receiveMaster(Socket socket) {
-        try {
-            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+        try (BufferedReader in = new BufferedReader(new InputStreamReader(
+                socket.getInputStream(), StandardCharsets.UTF_8))) {
             String line;
             while ((line = in.readLine()) != null) {
-                String[] p = line.split("\\|", -1);
-                switch (p[0]) {
-                    case "WELCOME" -> {
-                        updateMasterClock(Long.parseLong(p[1]));
-                        write("CONNECT", "SUCCESS", "마스터 연결, 대기열 초기화 (0/10)");
+                try {
+                    String[] p = line.split("\\|", -1);
+                    if (p.length == 0 || p[0].isEmpty()) {
+                        throw new IllegalArgumentException("빈 메시지");
                     }
-                    case "TASK" -> receiveTask(Task.fromWire(joinFrom(p, 1)));
-                    case "RESULT_ACK" -> receiveResultAck(p);
-                    case "P2P_ACK" -> receiveP2pAck(p);
-                    case "TERMINATE" -> {
-                        if (p.length > 1) updateMasterClock(Long.parseLong(p[1]));
-                        synchronized (queueLock) {
-                            stopping = true;
-                            queueLock.notifyAll();
+                    switch (p[0]) {
+                        case "WELCOME" -> {
+                            requireLength(p, 2);
+                            updateMasterClock(nonNegativeLong(p[1], "Master 시각"));
+                            write("CONNECT", "SUCCESS", "마스터 연결, 대기열 초기화 (0/10)");
                         }
+                        case "TASK" -> {
+                            if (p.length < 2) throw new IllegalArgumentException("TASK 필드 부족");
+                            receiveTask(Task.fromWire(joinFrom(p, 1)));
+                        }
+                        case "START" -> {
+                            requireLength(p, 2);
+                            updateMasterClock(nonNegativeLong(p[1], "처리 시작 시각"));
+                            synchronized (queueLock) {
+                                processingEnabled = true;
+                                queueLock.notifyAll();
+                            }
+                        }
+                        case "RESULT_ACK" -> receiveResultAck(p);
+                        case "P2P_ACK" -> receiveP2pAck(p);
+                        case "TERMINATE" -> {
+                            requireLength(p, 4);
+                            updateMasterClock(nonNegativeLong(p[1], "종료 시각"));
+                            masterReassignments = nonNegativeInt(p[2], "장애 재할당 수");
+                            masterP2pEvents = nonNegativeInt(p[3], "P2P 이벤트 수");
+                            synchronized (queueLock) {
+                                stopping = true;
+                                queue.clear();
+                                queueLock.notifyAll();
+                            }
+                        }
+                        case "MASTER_LOG_BEGIN" -> {
+                            requireLength(p, 2);
+                            nonNegativeLong(p[1], "Master 로그 크기");
+                            masterLogBytes.reset();
+                        }
+                        case "MASTER_LOG_CHUNK" -> receiveMasterLogChunk(p);
+                        case "MASTER_LOG_END" -> {
+                            requireLength(p, 1);
+                            saveMasterLog();
+                        }
+                        case "REJECT" -> {
+                            if (p.length < 2) throw new IllegalArgumentException("REJECT 사유 누락");
+                            write("CONNECT", "FAIL", "마스터 연결 거부: " + joinFrom(p, 1));
+                            synchronized (queueLock) {
+                                stopping = true;
+                                queueLock.notifyAll();
+                            }
+                        }
+                        default -> write("PROTO", "WARN", "알 수 없는 마스터 메시지: "
+                                + safeMessageType(line));
                     }
-                    case "MASTER_LOG_BEGIN" -> masterLogBytes.reset();
-                    case "MASTER_LOG_CHUNK" -> receiveMasterLogChunk(p);
-                    case "MASTER_LOG_END" -> saveMasterLog();
-                    default -> write("PROTO", "WARN", "알 수 없는 마스터 메시지: " + line);
+                } catch (IllegalArgumentException | IndexOutOfBoundsException e) {
+                    write("PROTO", "WARN", "마스터 메시지 거부: " + safeMessageType(line)
+                            + " (" + e.getMessage() + ")");
                 }
             }
-        } catch (IOException ignored) {
+        } catch (IOException e) {
+            if (!stopping) write("CONNECT", "FAIL", "마스터 연결 종료: " + e.getMessage());
             synchronized (queueLock) {
                 stopping = true;
+                queue.clear();
                 queueLock.notifyAll();
             }
         }
@@ -127,10 +192,12 @@ class WorkerNode implements Runnable {
 
     // Master 로그 조각 수신
     private void receiveMasterLogChunk(String[] p) {
-        if (p.length < 2) return;
+        requireLength(p, 2);
         try {
             masterLogBytes.write(java.util.Base64.getDecoder().decode(p[1]));
-        } catch (IOException | IllegalArgumentException ignored) { }
+        } catch (IOException | IllegalArgumentException e) {
+            throw new IllegalArgumentException("Master 로그 조각 오류", e);
+        }
     }
 
     // Master 로그를 Worker 실행 폴더에 저장
@@ -162,22 +229,35 @@ class WorkerNode implements Runnable {
 
     // Master 확정 결과 시각 반영
     private void receiveResultAck(String[] p) {
-        PendingResult result = pendingResults.remove(p[1]);
+        requireLength(p, 5);
+        int attempt = Integer.parseInt(p[2]);
+        if (attempt < 0 || (!"SUCCESS".equals(p[3]) && !"FAIL".equals(p[3]))) {
+            throw new IllegalArgumentException("RESULT_ACK 값 오류");
+        }
+        PendingResult result = pendingResults.remove(attemptKey(p[1], attempt));
         if (result == null) return;
-        updateMasterClock(Long.parseLong(p[3]));
+        updateMasterClock(nonNegativeLong(p[4], "결과 ACK 시각"));
         if (result.success) {
             write("PROC", "SUCCESS", "KV[" + result.task.id + "] 저장 완료, 처리="
                     + format(result.duration) + "초, 대기=" + format(result.wait) + "초");
         } else {
-            write("PROC", "FAIL", "KV[" + result.task.id + "] 처리 실패, 20% 규칙");
+            write("PROC", "FAIL", "KV[" + result.task.id + "] "
+                    + ("QUEUE_FULL".equals(result.reason)
+                    ? "Queue 초과로 재할당" : "처리 실패, 20% 규칙"));
         }
     }
 
     // Master 확정 P2P 시각 반영
     private void receiveP2pAck(String[] p) {
-        updateMasterClock(Long.parseLong(p[5]));
+        requireLength(p, 7);
+        if (!("SENT".equals(p[1]) || "RECEIVED".equals(p[1]))
+                || p[3].isBlank() || Integer.parseInt(p[4]) < 1) {
+            throw new IllegalArgumentException("P2P_ACK 값 오류");
+        }
+        updateMasterClock(nonNegativeLong(p[6], "P2P ACK 시각"));
         String action = "SENT".equals(p[1]) ? "이전 완료" : "수신 완료";
-        write("LB", "SUCCESS", "워커" + p[2] + " " + action + ", KV=" + p[4]);
+        write("LB", "SUCCESS", "워커" + p[2] + " " + action + ", 전송ID="
+                + p[3] + ", 작업=" + p[5]);
     }
 
     // Master 작업 Queue 삽입
@@ -186,21 +266,24 @@ class WorkerNode implements Runnable {
         boolean accepted;
         int size;
         synchronized (queueLock) {
-            accepted = queue.size() < QUEUE_LIMIT;
+            accepted = queue.size() + reservedTransferSlots < QUEUE_LIMIT;
             if (accepted) {
                 if (task.retry) queue.addFirst(task);
                 else queue.addLast(task);
-                size = queue.size();
+                size = queue.size() + reservedTransferSlots;
                 received++;
-                queueLock.notifyAll();
+                if (task.retry) retryReceived++;
             } else {
-                size = queue.size();
+                size = queue.size() + reservedTransferSlots;
             }
         }
         if (!accepted) {
-            pendingResults.put(task.id, new PendingResult(task, false, 0, 0));
+            pendingResults.put(attemptKey(task.id, task.attempts),
+                    new PendingResult(task, false, 0, 0, "QUEUE_FULL"));
+            queueRejects++;
             write("QUEUE", "FAIL", "KV[" + task.id + "] Queue 초과 거부 (10/10)");
-            sendMaster("RESULT|" + task.id + "|FAIL|0.00|0.00|" + size);
+            sendMaster("RESULT|" + task.id + "|" + task.attempts
+                    + "|FAIL|0.00|0.00|" + size + "|QUEUE_FULL");
             return;
         }
         String type = task.retry ? "우선 재시도" : "일반";
@@ -209,6 +292,9 @@ class WorkerNode implements Runnable {
         warnIfNeeded(size);
         sendMaster("STATUS|" + size);
         checkLoadBalance();
+        synchronized (queueLock) {
+            queueLock.notifyAll();
+        }
     }
 
     // Queue 작업 처리 반복
@@ -219,16 +305,20 @@ class WorkerNode implements Runnable {
             long start = Math.max(workerAvailableAt, task.enqueuedAt);
             double wait = Math.max(0, (start - task.enqueuedAt) / 1000.0);
             double duration = ThreadLocalRandom.current().nextDouble(1.0, 3.0);
-            workerAvailableAt = start + Math.round(duration * 1000.0);
+            synchronized (queueLock) {
+                workerAvailableAt = start + Math.round(duration * 1000.0);
+            }
             boolean ok = ThreadLocalRandom.current().nextInt(100) < 80;
             int size = queueSize();
             processed++;
             totalWait += wait;
             if (ok) success++;
             else fail++;
-            pendingResults.put(task.id, new PendingResult(task, ok, duration, wait));
-            sendMaster("RESULT|" + task.id + "|" + (ok ? "SUCCESS" : "FAIL") + "|"
-                    + format(duration) + "|" + format(wait) + "|" + size);
+            pendingResults.put(attemptKey(task.id, task.attempts),
+                    new PendingResult(task, ok, duration, wait, "PROCESS"));
+            sendMaster("RESULT|" + task.id + "|" + task.attempts + "|"
+                    + (ok ? "SUCCESS" : "FAIL") + "|"
+                    + format(duration) + "|" + format(wait) + "|" + size + "|PROCESS");
             warnIfNeeded(size);
             sendMaster("STATUS|" + size);
             checkLoadBalance();
@@ -238,7 +328,7 @@ class WorkerNode implements Runnable {
     // 다음 작업 대기·반환
     private Task takeTask() {
         synchronized (queueLock) {
-            while (queue.isEmpty() && !stopping) {
+            while ((!processingEnabled || queue.isEmpty()) && !stopping) {
                 try {
                     queueLock.wait();
                 } catch (InterruptedException e) {
@@ -246,89 +336,230 @@ class WorkerNode implements Runnable {
                     return null;
                 }
             }
+            if (stopping) return null;
             return queue.pollFirst();
         }
     }
 
     // P2P 부하 분산 조건 확인
-    private void checkLoadBalance() {
+    private synchronized void checkLoadBalance() {
         long now = masterClockMillis;
         if (now < nextLoadCheck) return;
         nextLoadCheck = now + ThreadLocalRandom.current().nextLong(1_000, 3_001);
+
+        int sourceQueueSize;
+        synchronized (queueLock) {
+            sourceQueueSize = queue.size();
+        }
+        double estimatedWait = sourceQueueSize * 2.0;
+        if (estimatedWait <= 15.0) return;
+
+        String requestId = "Q" + id + "-" + (++querySequence);
+        int[] targetLoad = findLeastLoadedPeer(requestId);
+        if (targetLoad == null) {
+            write("LB", "WARN", "예상 대기=" + format(estimatedWait)
+                    + "초, 응답 가능한 P2P 대상 없음");
+            return;
+        }
+
         List<Task> batch = new ArrayList<>();
         synchronized (queueLock) {
-            if (queue.size() * 2 <= 15) return;
-            for (int index = 0; index < 3 && !queue.isEmpty(); index++) batch.add(queue.pollLast());
+            estimatedWait = queue.size() * 2.0;
+            if (estimatedWait <= 15.0) return;
+            int transferable = Math.min(3,
+                    Math.min(queue.size(), QUEUE_LIMIT - targetLoad[1]));
+            for (int index = 0; index < transferable; index++) batch.add(queue.pollLast());
+            reservedTransferSlots += batch.size();
         }
-        int target = id % 4 + 1;
-        if (transfer(target, batch)) {
+        if (batch.isEmpty()) return;
+
+        int target = targetLoad[0];
+        String transferId = id + "-" + (++transferSequence);
+        if (transfer(target, transferId, batch)) {
+            synchronized (queueLock) {
+                reservedTransferSlots -= batch.size();
+            }
             p2pSent += batch.size();
-            sendMaster("P2P|SENT|" + target + "|" + batch.size() + "|" + taskIds(batch));
+            p2pSentEvents++;
+            sendMaster("P2P|SENT|" + target + "|" + transferId + "|" + batch.size()
+                    + "|" + taskRefs(batch));
+            write("LB", "INFO", "예상 대기=" + format(estimatedWait)
+                    + "초, 조회ID=" + requestId + ", 최소 Queue 워커" + target
+                    + "(" + targetLoad[1] + "/10)로 " + batch.size() + "건 이전 요청");
             int remaining = queueSize();
             warnIfNeeded(remaining);
             sendMaster("STATUS|" + remaining);
         } else {
             synchronized (queueLock) {
                 for (int index = batch.size() - 1; index >= 0; index--) queue.addLast(batch.get(index));
+                reservedTransferSlots -= batch.size();
                 queueLock.notifyAll();
             }
         }
     }
 
+    // 다른 Worker의 Queue를 조회해 가장 여유 있는 대상을 선택
+    private int[] findLeastLoadedPeer(String requestId) {
+        int targetId = 0;
+        int smallestQueue = Integer.MAX_VALUE;
+        for (int candidateId = 1; candidateId <= 4; candidateId++) {
+            if (candidateId == id) continue;
+            int candidateQueue = queryPeerQueue(candidateId, requestId);
+            if (candidateQueue < 0 || candidateQueue >= QUEUE_LIMIT) continue;
+            if (candidateQueue < smallestQueue
+                    || (candidateQueue == smallestQueue && candidateId < targetId)) {
+                targetId = candidateId;
+                smallestQueue = candidateQueue;
+            }
+        }
+        return targetId == 0 ? null : new int[] {targetId, smallestQueue};
+    }
+
+    // P2P 소켓으로 대상 Worker의 현재 Queue 크기 조회
+    private int queryPeerQueue(int target, String requestId) {
+        try (Socket peer = new Socket()) {
+            peer.connect(new InetSocketAddress("127.0.0.1", 6000 + target),
+                    P2P_TIMEOUT_MILLIS);
+            peer.setSoTimeout(P2P_TIMEOUT_MILLIS);
+            try (BufferedReader in = new BufferedReader(new InputStreamReader(
+                         peer.getInputStream(), StandardCharsets.UTF_8));
+                 PrintWriter out = new PrintWriter(new OutputStreamWriter(
+                         peer.getOutputStream(), StandardCharsets.UTF_8), true)) {
+                out.println("QUEUE_QUERY|" + requestId + "|" + id);
+                String response = in.readLine();
+                String[] p = response == null ? new String[0] : response.split("\\|", -1);
+                requireLength(p, 4);
+                if (!"QUEUE_STATUS".equals(p[0]) || !requestId.equals(p[1])
+                        || Integer.parseInt(p[2]) != target) {
+                    throw new IllegalArgumentException("QUEUE_STATUS 값 오류");
+                }
+                int size = Integer.parseInt(p[3]);
+                return size >= 0 && size <= QUEUE_LIMIT ? size : -1;
+            }
+        } catch (IOException | IllegalArgumentException e) {
+            return -1;
+        }
+    }
+
     // 인접 Worker 작업 이전 요청
-    private boolean transfer(int target, List<Task> batch) {
+    private boolean transfer(int target, String transferId, List<Task> batch) {
         if (batch.isEmpty()) return false;
         StringBuilder data = new StringBuilder();
         for (Task task : batch) {
             if (data.length() > 0) data.append(';');
             data.append(task.wire());
         }
-        try (Socket peer = new Socket("127.0.0.1", 6000 + target);
-             BufferedReader in = new BufferedReader(new InputStreamReader(peer.getInputStream()));
-             PrintWriter out = new PrintWriter(peer.getOutputStream(), true)) {
-            out.println("TRANSFER|" + id + "|" + data);
-            return "ACK".equals(in.readLine());
-        } catch (IOException e) {
-            return false;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try (Socket peer = new Socket()) {
+                peer.connect(new InetSocketAddress("127.0.0.1", 6000 + target),
+                        P2P_TIMEOUT_MILLIS);
+                peer.setSoTimeout(P2P_TIMEOUT_MILLIS);
+                try (BufferedReader in = new BufferedReader(new InputStreamReader(
+                             peer.getInputStream(), StandardCharsets.UTF_8));
+                     PrintWriter out = new PrintWriter(new OutputStreamWriter(
+                             peer.getOutputStream(), StandardCharsets.UTF_8), true)) {
+                    out.println("TRANSFER|" + transferId + "|" + id + "|" + data);
+                    String response = in.readLine();
+                    if (("ACK|" + transferId).equals(response)) return true;
+                    if (response != null && response.startsWith("REJECT|")) return false;
+                }
+            } catch (IOException e) {
+                if (attempt == 1) {
+                    write("LB", "WARN", "전송ID=" + transferId + " P2P ACK 제한시간 초과");
+                }
+            }
         }
+        return false;
     }
 
     // P2P 작업 수신 서버 시작
     private void startPeerListener() {
         Thread peerThread = new Thread(() -> {
             try (ServerSocket server = new ServerSocket(peerPort)) {
+                server.setSoTimeout(1_000);
                 while (!stopping) {
-                    try (Socket peer = server.accept();
-                         BufferedReader in = new BufferedReader(new InputStreamReader(peer.getInputStream()));
-                         PrintWriter out = new PrintWriter(peer.getOutputStream(), true)) {
+                    try (Socket peer = server.accept()) {
+                        peer.setSoTimeout(P2P_TIMEOUT_MILLIS);
+                        try (BufferedReader in = new BufferedReader(new InputStreamReader(
+                                     peer.getInputStream(), StandardCharsets.UTF_8));
+                             PrintWriter out = new PrintWriter(new OutputStreamWriter(
+                                     peer.getOutputStream(), StandardCharsets.UTF_8), true)) {
                         String line = in.readLine();
                         if (line == null) continue;
-                        String[] p = line.split("\\|", 3);
-                        if (!"TRANSFER".equals(p[0])) continue;
-                        String[] encoded = p[2].split(";");
-                        boolean accepted;
-                        List<Task> tasks = new ArrayList<>();
-                        for (String item : encoded) tasks.add(Task.fromWire(item));
-                        synchronized (queueLock) {
-                            accepted = queue.size() + tasks.size() <= QUEUE_LIMIT;
-                            if (accepted) {
-                                queue.addAll(tasks);
-                                received += tasks.size();
-                                queueLock.notifyAll();
+                        try {
+                            String[] p = line.split("\\|", -1);
+                            if (p.length == 3 && "QUEUE_QUERY".equals(p[0])) {
+                                if (p[1].isBlank()) {
+                                    throw new IllegalArgumentException("QUEUE_QUERY ID 오류");
+                                }
+                                int sourceId = Integer.parseInt(p[2]);
+                                if (sourceId < 1 || sourceId > 4 || sourceId == id) {
+                                    throw new IllegalArgumentException("조회 Worker 번호 오류");
+                                }
+                                out.println("QUEUE_STATUS|" + p[1] + "|" + id
+                                        + "|" + queueSize());
+                                continue;
                             }
+                            requireLength(p, 4);
+                            if (!"TRANSFER".equals(p[0]) || p[1].isBlank()) {
+                                throw new IllegalArgumentException("TRANSFER 형식 오류");
+                            }
+                            String transferId = p[1];
+                            int sourceId = Integer.parseInt(p[2]);
+                            if (sourceId < 1 || sourceId > 4 || sourceId == id) {
+                                throw new IllegalArgumentException("송신 Worker 번호 오류");
+                            }
+                            if (acceptedTransferIds.contains(transferId)) {
+                                out.println("ACK|" + transferId);
+                                continue;
+                            }
+                            String[] encoded = p[3].split(";");
+                            if (encoded.length < 1 || encoded.length > 3) {
+                                throw new IllegalArgumentException("P2P 작업 수 오류");
+                            }
+                            List<Task> tasks = new ArrayList<>();
+                            for (String item : encoded) tasks.add(Task.fromWire(item));
+                            boolean accepted;
+                            synchronized (queueLock) {
+                                accepted = queue.size() + reservedTransferSlots + tasks.size()
+                                        <= QUEUE_LIMIT
+                                        && tasks.stream().noneMatch(this::containsTaskLocked);
+                                if (accepted) {
+                                    queue.addAll(tasks);
+                                    acceptedTransferIds.add(transferId);
+                                    received += tasks.size();
+                                    for (Task task : tasks) {
+                                        if (task.retry) retryReceived++;
+                                    }
+                                    queueLock.notifyAll();
+                                }
+                            }
+                            if (accepted) {
+                                // 수락 여부를 먼저 확정해 송신자가 불필요하게 작업을 복원하지 않게 한다.
+                                out.println("ACK|" + transferId);
+                                p2pReceived += tasks.size();
+                                p2pReceivedEvents++;
+                                sendMaster("P2P|RECEIVED|" + sourceId + "|" + transferId
+                                        + "|" + tasks.size() + "|" + taskRefs(tasks));
+                                int size = queueSize();
+                                warnIfNeeded(size);
+                                sendMaster("STATUS|" + size);
+                            } else {
+                                out.println("REJECT|Queue 여유 부족 또는 중복 작업");
+                            }
+                        } catch (IllegalArgumentException e) {
+                            write("PROTO", "WARN", "P2P 메시지 거부: " + e.getMessage());
+                            out.println("REJECT|메시지 형식 오류");
                         }
-                        if (accepted) {
-                            p2pReceived += tasks.size();
-                            sendMaster("P2P|RECEIVED|" + p[1] + "|" + tasks.size() + "|"
-                                    + taskIds(tasks));
-                            int size = queueSize();
-                            warnIfNeeded(size);
-                            sendMaster("STATUS|" + size);
-                            out.println("ACK");
-                        } else out.println("REJECT");
+                        }
+                    } catch (SocketTimeoutException ignored) {
+                        // stopping 상태를 주기적으로 확인한다.
+                    } catch (IOException e) {
+                        if (!stopping) write("LB", "WARN", "P2P 연결 처리 실패: " + e.getMessage());
                     }
                 }
-            } catch (IOException ignored) {
+            } catch (IOException e) {
+                if (!stopping) write("CONNECT", "FAIL", "P2P 포트 시작 실패: " + e.getMessage());
             }
         }, "worker-peer-listener-" + id);
         peerThread.setDaemon(true);
@@ -338,7 +569,7 @@ class WorkerNode implements Runnable {
     // 현재 Queue 크기 반환
     private int queueSize() {
         synchronized (queueLock) {
-            return queue.size();
+            return queue.size() + reservedTransferSlots;
         }
     }
 
@@ -363,9 +594,18 @@ class WorkerNode implements Runnable {
         write("STAT", "INFO", "총 수신 작업: " + received);
         write("STAT", "SUCCESS", "성공: " + success);
         write("STAT", "FAIL", "실패: " + fail);
+        write("STAT", "WARN", "Queue 초과 거부: " + queueRejects);
         write("STAT", "INFO", "평균 대기 시간: "
                 + format(processed == 0 ? 0 : totalWait / processed) + "초");
+        write("STAT", "INFO", "장애 재할당 발생(해당 Worker): " + fail);
+        write("STAT", "INFO", "재시도 작업 수신: " + retryReceived);
+        write("STAT", "INFO", "장애 재할당 횟수(Master 전체): " + masterReassignments);
+        write("STAT", "INFO", "P2P 전송 이벤트(해당 Worker): " + p2pSentEvents);
+        write("STAT", "INFO", "P2P 수신 이벤트(해당 Worker): " + p2pReceivedEvents);
+        write("STAT", "INFO", "P2P 관여 이벤트 합계(해당 Worker): "
+                + (p2pSentEvents + p2pReceivedEvents));
         write("STAT", "INFO", "P2P 작업 전송/수신: " + p2pSent + " / " + p2pReceived);
+        write("STAT", "INFO", "P2P 부하 분산 이벤트(Master 전체): " + masterP2pEvents);
         write("STAT", "INFO", "전체 수행 시간: " + VirtualClock.format(masterClockMillis) + "초");
         write("TERMINATE", "SUCCESS", "워커" + id + " 정상 연결 해제");
     }
@@ -380,14 +620,22 @@ class WorkerNode implements Runnable {
         if (log != null) log.log(time, "WORKER" + id, event, status, message);
     }
 
-    // P2P 작업 번호 문자열 생성
-    private static String taskIds(List<Task> tasks) {
+    // P2P 작업 ID와 처리 시도 번호 문자열 생성
+    private static String taskRefs(List<Task> tasks) {
         StringBuilder ids = new StringBuilder();
         for (Task task : tasks) {
             if (ids.length() > 0) ids.append(',');
-            ids.append("KV[").append(task.id).append(']');
+            ids.append(task.id).append(':').append(task.attempts);
         }
         return ids.toString();
+    }
+
+    private boolean containsTaskLocked(Task candidate) {
+        if (pendingResults.containsKey(attemptKey(candidate.id, candidate.attempts))) return true;
+        for (Task task : queue) {
+            if (task.id.equals(candidate.id) && task.attempts == candidate.attempts) return true;
+        }
+        return false;
     }
 
     // 분리 문자열 재결합
@@ -398,6 +646,35 @@ class WorkerNode implements Runnable {
             result.append(values[index]);
         }
         return result.toString();
+    }
+
+    private static String attemptKey(String taskId, int attempt) {
+        return taskId + ":" + attempt;
+    }
+
+    private static void requireLength(String[] values, int expected) {
+        if (values.length != expected) {
+            throw new IllegalArgumentException("필드 수 오류: " + values.length + "/" + expected);
+        }
+    }
+
+    private static long nonNegativeLong(String value, String label) {
+        long parsed = Long.parseLong(value);
+        if (parsed < 0) throw new IllegalArgumentException(label + " 범위 오류");
+        return parsed;
+    }
+
+    private static int nonNegativeInt(String value, String label) {
+        int parsed = Integer.parseInt(value);
+        if (parsed < 0) throw new IllegalArgumentException(label + " 범위 오류");
+        return parsed;
+    }
+
+    private static String safeMessageType(String line) {
+        if (line == null || line.isBlank()) return "<empty>";
+        int separator = line.indexOf('|');
+        String type = separator < 0 ? line : line.substring(0, separator);
+        return type.length() > 32 ? type.substring(0, 32) : type;
     }
 
     // 소수점 둘째 자리 형식화
