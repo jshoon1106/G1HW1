@@ -5,7 +5,6 @@ import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -26,7 +25,6 @@ class MasterNode {
     private static final int WORKER_COUNT = 4;
     private static final int TASK_COUNT = 5000;
     private static final int QUEUE_LIMIT = 10;
-    private static final int CONNECTION_TIMEOUT_MILLIS = 60_000;
     private static final int SOCKET_TIMEOUT_MILLIS = 120_000;
     private static final int TERMINATION_TIMEOUT_SECONDS = 30;
     private static final int COMPLETION_TIMEOUT_MINUTES = 5;
@@ -66,7 +64,6 @@ class MasterNode {
         try (EventLogger eventLog = new EventLogger("Master.txt");
              ServerSocket server = new ServerSocket(port)) {
             log = eventLog;
-            server.setSoTimeout(CONNECTION_TIMEOUT_MILLIS);
             log.header("Master.txt (Master Node Log)", "Master Node | Distributed KV Store");
             write("INIT", "INFO", "시스템 시계 시작, 포트 " + port + " 연결 대기");
             generateTasks();
@@ -120,45 +117,40 @@ class MasterNode {
     // Worker 4개 연결 수락
     private void acceptWorkers(ServerSocket server) throws IOException {
         while (workers.size() < WORKER_COUNT) {
+            Socket socket = server.accept();
+            socket.setKeepAlive(true);
+            socket.setSoTimeout(SOCKET_TIMEOUT_MILLIS);
+            BufferedReader in = new BufferedReader(new InputStreamReader(
+                    socket.getInputStream(), StandardCharsets.UTF_8));
+            PrintWriter out = new PrintWriter(new OutputStreamWriter(
+                    socket.getOutputStream(), StandardCharsets.UTF_8), true);
             try {
-                Socket socket = server.accept();
-                socket.setKeepAlive(true);
-                socket.setSoTimeout(SOCKET_TIMEOUT_MILLIS);
-                BufferedReader in = new BufferedReader(new InputStreamReader(
-                        socket.getInputStream(), StandardCharsets.UTF_8));
-                PrintWriter out = new PrintWriter(new OutputStreamWriter(
-                        socket.getOutputStream(), StandardCharsets.UTF_8), true);
-                try {
-                    String hello = in.readLine();
-                    String[] p = hello == null ? new String[0] : hello.split("\\|", -1);
-                    if (p.length != 3 || !"HELLO".equals(p[0])) {
-                        out.println("REJECT|HELLO 메시지 형식 오류");
-                        socket.close();
-                        continue;
-                    }
-                    int id = Integer.parseInt(p[1]);
-                    int peerPort = Integer.parseInt(p[2]);
-                    if (id < 1 || id > WORKER_COUNT || workers.containsKey(id)
-                            || peerPort < 1 || peerPort > 65_535) {
-                        out.println("REJECT|잘못된 워커 정보");
-                        socket.close();
-                        continue;
-                    }
-                    WorkerInfo worker = new WorkerInfo(id, out);
-                    workers.put(id, worker);
-                    worker.send("WELCOME|" + clock.now());
-                    write("CONNECT", "SUCCESS", "워커" + id + " 연결, 대기열 초기화 (0/10)");
-                    Thread reader = new Thread(() -> readWorker(worker, in),
-                            "master-reader-" + id);
-                    reader.setDaemon(true);
-                    reader.start();
-                } catch (IllegalArgumentException e) {
-                    out.println("REJECT|HELLO 값 오류");
+                String hello = in.readLine();
+                String[] p = hello == null ? new String[0] : hello.split("\\|", -1);
+                if (p.length != 3 || !"HELLO".equals(p[0])) {
+                    out.println("REJECT|HELLO 메시지 형식 오류");
                     socket.close();
+                    continue;
                 }
-            } catch (SocketTimeoutException e) {
-                throw new IOException("워커 연결 제한시간 초과: " + workers.size()
-                        + "/" + WORKER_COUNT + " 연결", e);
+                int id = Integer.parseInt(p[1]);
+                int peerPort = Integer.parseInt(p[2]);
+                if (id < 1 || id > WORKER_COUNT || workers.containsKey(id)
+                        || peerPort < 1 || peerPort > 65_535) {
+                    out.println("REJECT|잘못된 워커 정보");
+                    socket.close();
+                    continue;
+                }
+                WorkerInfo worker = new WorkerInfo(id, out);
+                workers.put(id, worker);
+                worker.send("WELCOME|" + clock.now());
+                write("CONNECT", "SUCCESS", "워커" + id + " 연결, 대기열 초기화 (0/10)");
+                Thread reader = new Thread(() -> readWorker(worker, in),
+                        "master-reader-" + id);
+                reader.setDaemon(true);
+                reader.start();
+            } catch (IllegalArgumentException e) {
+                out.println("REJECT|HELLO 값 오류");
+                socket.close();
             }
         }
     }
@@ -433,29 +425,38 @@ class MasterNode {
         for (Map.Entry<String, Integer> entry : new java.util.TreeMap<>(kvStore).entrySet()) {
             write("KV", "SUCCESS", "Key=" + entry.getKey() + ", Value=" + entry.getValue());
         }
-        write("STAT", "INFO", "=== 최종 통계 ===");
-        write("STAT", "INFO", "KV 처리 완료 수: " + kvStore.size());
-        int totalAttempts = totalSuccess + totalFail;
-        double successRate = totalAttempts == 0 ? 0.0 : totalSuccess * 100.0 / totalAttempts;
-        double failRate = totalAttempts == 0 ? 0.0 : totalFail * 100.0 / totalAttempts;
-        write("STAT", "SUCCESS", String.format("총 성공: %,d (%.1f%%)", totalSuccess, successRate));
-        write("STAT", "FAIL", String.format("총 실패(재시도 전): %,d (%.1f%%)", totalFail, failRate));
-        write("STAT", "WARN", "Queue 초과 거부 수: " + totalQueueRejects);
-        write("STAT", "INFO", "장애 재할당 수: " + reassignmentCount);
-        write("STAT", "INFO", "Queue 초과 재시도 수: " + queueRetryCount);
-        write("STAT", "INFO", "P2P 부하 분산 수: " + p2pEvents);
+        int totalProcessed = 0;
+        double totalWait = 0.0;
         for (WorkerInfo worker : workers.values()) {
-            double averageWait = worker.processed == 0 ? 0.0
+            totalProcessed += worker.processed;
+            totalWait += worker.totalWait;
+        }
+        double averageWait = totalProcessed == 0 ? 0.0 : totalWait / totalProcessed;
+
+        write("STAT", "INFO", "=== MASTER 최종 통계 ===");
+        write("STAT", "INFO", "작업 처리량: " + totalSuccess);
+        write("STAT", "SUCCESS", "성공 횟수: " + totalSuccess);
+        write("STAT", "FAIL", "실패 횟수: " + totalFail);
+        write("STAT", "INFO", "평균 대기 시간: "
+                + String.format(java.util.Locale.US, "%.2f", averageWait) + "초");
+        write("STAT", "INFO", "P2P 부하 분산 이벤트 횟수: " + p2pEvents);
+        write("STAT", "INFO", "장애 재할당 횟수: " + reassignmentCount);
+        write("STAT", "WARN", "Queue 초과 거부 수: " + totalQueueRejects);
+        write("STAT", "INFO", "Queue 초과 재시도 수: " + queueRetryCount);
+        List<WorkerInfo> orderedWorkers = new ArrayList<>(workers.values());
+        orderedWorkers.sort(Comparator.comparingInt(worker -> worker.id));
+        for (WorkerInfo worker : orderedWorkers) {
+            double workerAverageWait = worker.processed == 0 ? 0.0
                     : worker.totalWait / worker.processed;
-            write("STAT", "INFO", "워커" + worker.id + ": 처리=" + worker.processed
-                    + ", 성공=" + worker.success + ", 실패=" + worker.fail
-                    + ", 장애재할당발생=" + worker.fail
-                    + ", 평균대기=" + String.format(java.util.Locale.US, "%.2f", averageWait) + "초"
-                    + ", 재시도수신=" + worker.retryReceived
-                    + ", Queue거부=" + worker.queueRejects
-                    + ", P2P 이벤트 전송=" + worker.p2pSentEvents
-                    + ", 수신=" + worker.p2pReceivedEvents
-                    + ", P2P 작업 전송=" + worker.p2pSent + ", 수신=" + worker.p2pReceived);
+            write("STAT", "INFO", "워커" + worker.id
+                    + ": 작업 처리량=" + worker.success
+                    + ", 성공 횟수=" + worker.success + ", 실패 횟수=" + worker.fail
+                    + ", 평균 대기 시간="
+                    + String.format(java.util.Locale.US, "%.2f", workerAverageWait) + "초"
+                    + ", P2P 부하 분산 이벤트 횟수="
+                    + (worker.p2pSentEvents + worker.p2pReceivedEvents)
+                    + ", 장애 재할당 횟수=" + worker.fail
+                    + ", 전체 수행 시간=" + VirtualClock.format(clock.now()) + "초");
         }
         write("STAT", "INFO", "전체 수행 시간: " + VirtualClock.format(clock.now()) + "초");
     }

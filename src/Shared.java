@@ -81,6 +81,7 @@ class VirtualClock {
 }
 
 class EventLogger implements AutoCloseable {
+    static final Object CONSOLE_LOCK = new Object();
     private final BufferedWriter writer;
 
     // 로그 파일 생성
@@ -101,7 +102,9 @@ class EventLogger implements AutoCloseable {
         } catch (IOException e) {
             throw new RuntimeException("로그 기록 실패", e);
         }
-        System.out.println(line);
+        synchronized (CONSOLE_LOCK) {
+            System.out.println(line);
+        }
     }
 
     // 로그 파일 제목 출력

@@ -1,3 +1,6 @@
 @echo off
-pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-workers.ps1"
-exit /b %errorlevel%
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-workers.ps1" -NoPause
+set "exitCode=%errorlevel%"
+echo.
+pause
+exit /b %exitCode%

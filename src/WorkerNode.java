@@ -104,7 +104,9 @@ class WorkerNode implements Runnable {
                 processLoop();
                 if (id == 1 && isRemoteMaster()) sendMaster("LOG_REQUEST");
                 sendMaster("TERMINATE_ACK");
-                writeFinalStatistics();
+                synchronized (EventLogger.CONSOLE_LOCK) {
+                    writeFinalStatistics();
+                }
                 waitForMasterLog();
             }
         } catch (IOException e) {
@@ -591,21 +593,14 @@ class WorkerNode implements Runnable {
     // Worker 최종 통계 기록
     private void writeFinalStatistics() {
         write("STAT", "INFO", "=== WORKER" + id + " 최종 통계 ===");
-        write("STAT", "INFO", "총 수신 작업: " + received);
-        write("STAT", "SUCCESS", "성공: " + success);
-        write("STAT", "FAIL", "실패: " + fail);
-        write("STAT", "WARN", "Queue 초과 거부: " + queueRejects);
+        write("STAT", "INFO", "작업 처리량: " + success);
+        write("STAT", "SUCCESS", "성공 횟수: " + success);
+        write("STAT", "FAIL", "실패 횟수: " + fail);
         write("STAT", "INFO", "평균 대기 시간: "
                 + format(processed == 0 ? 0 : totalWait / processed) + "초");
-        write("STAT", "INFO", "장애 재할당 발생(해당 Worker): " + fail);
-        write("STAT", "INFO", "재시도 작업 수신: " + retryReceived);
-        write("STAT", "INFO", "장애 재할당 횟수(Master 전체): " + masterReassignments);
-        write("STAT", "INFO", "P2P 전송 이벤트(해당 Worker): " + p2pSentEvents);
-        write("STAT", "INFO", "P2P 수신 이벤트(해당 Worker): " + p2pReceivedEvents);
-        write("STAT", "INFO", "P2P 관여 이벤트 합계(해당 Worker): "
+        write("STAT", "INFO", "P2P 부하 분산 이벤트 횟수: "
                 + (p2pSentEvents + p2pReceivedEvents));
-        write("STAT", "INFO", "P2P 작업 전송/수신: " + p2pSent + " / " + p2pReceived);
-        write("STAT", "INFO", "P2P 부하 분산 이벤트(Master 전체): " + masterP2pEvents);
+        write("STAT", "INFO", "장애 재할당 횟수: " + fail);
         write("STAT", "INFO", "전체 수행 시간: " + VirtualClock.format(masterClockMillis) + "초");
         write("TERMINATE", "SUCCESS", "워커" + id + " 정상 연결 해제");
     }
