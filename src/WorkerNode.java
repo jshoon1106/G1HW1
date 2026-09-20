@@ -27,6 +27,7 @@ class WorkerNode implements Runnable {
     private static final int CONNECT_TIMEOUT_MILLIS = 10_000;
     private static final int SOCKET_TIMEOUT_MILLIS = 120_000;
     private static final int P2P_TIMEOUT_MILLIS = 5_000;
+    private static final int TERMINATION_CLOCK_TIMEOUT_SECONDS = 30;
     private final int id;
     private final String masterHost;
     private final int masterPort;
@@ -37,6 +38,7 @@ class WorkerNode implements Runnable {
     private final Set<String> acceptedTransferIds = ConcurrentHashMap.newKeySet();
     private final ByteArrayOutputStream masterLogBytes = new ByteArrayOutputStream();
     private final CountDownLatch masterLogReceived = new CountDownLatch(1);
+    private final CountDownLatch finalClockReceived = new CountDownLatch(1);
     private volatile boolean stopping;
     private boolean processingEnabled;
     private volatile long masterClockMillis;
@@ -104,6 +106,7 @@ class WorkerNode implements Runnable {
                 processLoop();
                 if (id == 1 && isRemoteMaster()) sendMaster("LOG_REQUEST");
                 sendMaster("TERMINATE_ACK");
+                awaitFinalClock();
                 synchronized (EventLogger.CONSOLE_LOCK) {
                     writeFinalStatistics();
                 }
@@ -145,6 +148,11 @@ class WorkerNode implements Runnable {
                         }
                         case "RESULT_ACK" -> receiveResultAck(p);
                         case "P2P_ACK" -> receiveP2pAck(p);
+                        case "FINAL_CLOCK" -> {
+                            requireLength(p, 2);
+                            updateMasterClock(nonNegativeLong(p[1], "최종 Master 시각"));
+                            finalClockReceived.countDown();
+                        }
                         case "TERMINATE" -> {
                             requireLength(p, 4);
                             updateMasterClock(nonNegativeLong(p[1], "종료 시각"));
@@ -217,6 +225,15 @@ class WorkerNode implements Runnable {
         if (id != 1 || !isRemoteMaster()) return;
         try {
             masterLogReceived.await(15, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // 모든 Worker의 종료 ACK가 반영된 공통 최종 시각 대기
+    private void awaitFinalClock() {
+        try {
+            finalClockReceived.await(TERMINATION_CLOCK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
@@ -427,8 +444,12 @@ class WorkerNode implements Runnable {
                          peer.getInputStream(), StandardCharsets.UTF_8));
                  PrintWriter out = new PrintWriter(new OutputStreamWriter(
                          peer.getOutputStream(), StandardCharsets.UTF_8), true)) {
+                reportPeerMessage("QUEUE_QUERY", id, target);
                 out.println("QUEUE_QUERY|" + requestId + "|" + id);
                 String response = in.readLine();
+                if (response != null) {
+                    reportPeerMessage("QUEUE_STATUS", target, id);
+                }
                 String[] p = response == null ? new String[0] : response.split("\\|", -1);
                 requireLength(p, 4);
                 if (!"QUEUE_STATUS".equals(p[0]) || !requestId.equals(p[1])
@@ -460,8 +481,14 @@ class WorkerNode implements Runnable {
                              peer.getInputStream(), StandardCharsets.UTF_8));
                      PrintWriter out = new PrintWriter(new OutputStreamWriter(
                              peer.getOutputStream(), StandardCharsets.UTF_8), true)) {
+                    reportPeerMessage("TRANSFER", id, target);
                     out.println("TRANSFER|" + transferId + "|" + id + "|" + data);
                     String response = in.readLine();
+                    if (response != null) {
+                        String responseType = response.startsWith("ACK|")
+                                ? "TRANSFER_ACK" : "TRANSFER_REJECT";
+                        reportPeerMessage(responseType, target, id);
+                    }
                     if (("ACK|" + transferId).equals(response)) return true;
                     if (response != null && response.startsWith("REJECT|")) return false;
                 }
@@ -583,6 +610,11 @@ class WorkerNode implements Runnable {
     // Master 메시지 전송
     private synchronized void sendMaster(String message) {
         if (masterOut != null) masterOut.println(message);
+    }
+
+    // Worker 간 단방향 메시지 한 건을 Master에 알린다.
+    private void reportPeerMessage(String messageType, int sourceId, int targetId) {
+        sendMaster("NET|" + messageType + "|" + sourceId + "|" + targetId);
     }
 
     // Master 단일 가상 시각 반영

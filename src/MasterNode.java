@@ -72,7 +72,8 @@ class MasterNode {
                 write("INIT", "SUCCESS", "워커 4개 연결 완료, 작업 배정 시작");
                 dispatchAvailableTasks();
                 for (WorkerInfo worker : workers.values()) {
-                    worker.send("START|" + clock.now());
+                    long sentAt = advanceNetworkDelay("START", "MASTER", "WORKER" + worker.id);
+                    worker.send("START|" + sentAt);
                 }
             }
             if (!completionSignal.await(COMPLETION_TIMEOUT_MINUTES, TimeUnit.MINUTES)) {
@@ -80,7 +81,7 @@ class MasterNode {
                     terminating = true;
                     write("TERMINATE", "FAIL", "전체 처리 제한시간 초과, 강제 종료 신호 전송");
                     for (WorkerInfo worker : workers.values()) {
-                        if (worker.connected) worker.send(terminationMessage());
+                        if (worker.connected) sendTermination(worker);
                     }
                 }
             }
@@ -126,8 +127,10 @@ class MasterNode {
                     socket.getOutputStream(), StandardCharsets.UTF_8), true);
             try {
                 String hello = in.readLine();
+                advanceNetworkDelay("HELLO", "WORKER", "MASTER");
                 String[] p = hello == null ? new String[0] : hello.split("\\|", -1);
                 if (p.length != 3 || !"HELLO".equals(p[0])) {
+                    advanceNetworkDelay("REJECT", "MASTER", "WORKER");
                     out.println("REJECT|HELLO 메시지 형식 오류");
                     socket.close();
                     continue;
@@ -136,19 +139,22 @@ class MasterNode {
                 int peerPort = Integer.parseInt(p[2]);
                 if (id < 1 || id > WORKER_COUNT || workers.containsKey(id)
                         || peerPort < 1 || peerPort > 65_535) {
+                    advanceNetworkDelay("REJECT", "MASTER", "WORKER" + id);
                     out.println("REJECT|잘못된 워커 정보");
                     socket.close();
                     continue;
                 }
                 WorkerInfo worker = new WorkerInfo(id, out);
                 workers.put(id, worker);
-                worker.send("WELCOME|" + clock.now());
+                long welcomedAt = advanceNetworkDelay("WELCOME", "MASTER", "WORKER" + id);
+                worker.send("WELCOME|" + welcomedAt);
                 write("CONNECT", "SUCCESS", "워커" + id + " 연결, 대기열 초기화 (0/10)");
                 Thread reader = new Thread(() -> readWorker(worker, in),
                         "master-reader-" + id);
                 reader.setDaemon(true);
                 reader.start();
             } catch (IllegalArgumentException e) {
+                advanceNetworkDelay("REJECT", "MASTER", "WORKER");
                 out.println("REJECT|HELLO 값 오류");
                 socket.close();
             }
@@ -181,6 +187,9 @@ class MasterNode {
                 if (p.length == 0 || p[0].isEmpty()) {
                     throw new IllegalArgumentException("빈 메시지");
                 }
+                if (!"NET".equals(p[0]) && !"LOG_REQUEST".equals(p[0])) {
+                    advanceNetworkDelay(p[0], "WORKER" + worker.id, "MASTER");
+                }
                 switch (p[0]) {
                     case "STATUS" -> {
                         requireLength(p, 2);
@@ -192,6 +201,7 @@ class MasterNode {
                     }
                     case "RESULT" -> handleResult(worker, p);
                     case "P2P" -> handleP2p(worker, p);
+                    case "NET" -> handlePeerNetwork(worker, p);
                     case "LOG_REQUEST" -> {
                         requireLength(p, 1);
                         worker.logRequested = true;
@@ -201,6 +211,7 @@ class MasterNode {
                         if (!worker.terminationAcked) {
                             worker.terminationAcked = true;
                             terminationAcks.countDown();
+                            if (terminationAcks.getCount() == 0) broadcastFinalClock();
                         }
                     }
                     default -> write("PROTO", "WARN", "워커" + worker.id
@@ -241,17 +252,15 @@ class MasterNode {
         String attemptKey = task.id + ":" + attempt;
         if (!processedAttempts.add(attemptKey)) {
             write("RESULT", "WARN", "KV[" + task.id + "] 중복 결과 무시, 시도=" + attempt);
-            worker.send("RESULT_ACK|" + task.id + "|" + attempt + "|" + result
-                    + "|" + clock.now());
+            sendResultAck(worker, task.id, attempt, result);
             return;
         }
         if (completedTaskIds.contains(task.id)) {
             write("RESULT", "WARN", "KV[" + task.id + "] 이미 완료된 결과 무시, 시도=" + attempt);
-            worker.send("RESULT_ACK|" + task.id + "|" + attempt + "|" + result
-                    + "|" + clock.now());
+            sendResultAck(worker, task.id, attempt, result);
             return;
         }
-        clock.advanceSeconds(duration + 1.0);
+        clock.advanceSeconds(duration);
         if ("PROCESS".equals(reason)) {
             worker.processed++;
             worker.totalWait += wait;
@@ -288,8 +297,7 @@ class MasterNode {
                 write("RESULT", "WARN", "KV[" + task.id + "] 재시도 Queue 중복 등록 방지");
             }
         }
-        worker.send("RESULT_ACK|" + task.id + "|" + attempt + "|" + result
-                + "|" + clock.now());
+        sendResultAck(worker, task.id, attempt, result);
     }
 
     // P2P 이전 결과 처리
@@ -306,7 +314,6 @@ class MasterNode {
                 || count > 3 || transferred.size() != count) {
             throw new IllegalArgumentException("P2P 값 오류");
         }
-        clock.advanceSeconds(1.0);
         if ("SENT".equals(direction)) {
             worker.p2pSent += count;
             worker.p2pSentEvents++;
@@ -327,8 +334,24 @@ class MasterNode {
         write("LB", "SUCCESS", "워커" + worker.id + " " + action
                 + ", 대상 워커" + peerId + ", 전송ID=" + transferId
                 + ", 수량=" + count + ", 작업=" + taskRefs);
+        long acknowledgedAt = advanceNetworkDelay("P2P_ACK", "MASTER", "WORKER" + worker.id);
         worker.send("P2P_ACK|" + direction + "|" + peerId + "|" + transferId
-                + "|" + count + "|" + taskRefs + "|" + clock.now());
+                + "|" + count + "|" + taskRefs + "|" + acknowledgedAt);
+    }
+
+    // Worker 간 단방향 메시지 한 건의 지연 반영
+    private void handlePeerNetwork(WorkerInfo reporter, String[] p) {
+        requireLength(p, 4);
+        String messageType = p[1];
+        int sourceId = Integer.parseInt(p[2]);
+        int targetId = Integer.parseInt(p[3]);
+        if (messageType.isBlank() || messageType.length() > 32
+                || sourceId < 1 || sourceId > WORKER_COUNT
+                || targetId < 1 || targetId > WORKER_COUNT || sourceId == targetId
+                || (reporter.id != sourceId && reporter.id != targetId)) {
+            throw new IllegalArgumentException("NET 값 오류");
+        }
+        advanceNetworkDelay(messageType, "WORKER" + sourceId, "WORKER" + targetId);
     }
 
     // 여유 Queue 대상 작업 배정
@@ -344,7 +367,7 @@ class MasterNode {
                 return;
             }
             retryExcludedWorkerIds.remove(task.id);
-            task.enqueuedAt = clock.advanceSeconds(1.0);
+            task.enqueuedAt = advanceNetworkDelay("TASK", "MASTER", "WORKER" + target.id);
             target.queueSize++;
             target.taskAttempts.put(task.id, task.attempts);
             if (task.retry) target.retryReceived++;
@@ -415,7 +438,7 @@ class MasterNode {
         retryQueuedTaskIds.clear();
         retryExcludedWorkerIds.clear();
         write("DISTRIB", "SUCCESS", "KV 작업 5,000개 처리 완료, 종료 신호 전송");
-        for (WorkerInfo worker : workers.values()) worker.send(terminationMessage());
+        for (WorkerInfo worker : workers.values()) sendTermination(worker);
         completionSignal.countDown();
     }
 
@@ -498,6 +521,33 @@ class MasterNode {
             receiver.send("MASTER_LOG_END");
         } catch (IOException e) {
             // 로그 전송 실패는 Master 실행 로그에 기록하지 않는다.
+        }
+    }
+
+    // 노드 간 애플리케이션 메시지 한 방향 전송에 1초 반영
+    private long advanceNetworkDelay(String messageType, String source, String target) {
+        long confirmedAt = clock.advanceSeconds(1.0);
+        write("NET", "INFO", source + " -> " + target + ", 메시지=" + messageType
+                + ", 통신 지연=1.00초");
+        return confirmedAt;
+    }
+
+    private void sendResultAck(WorkerInfo worker, String taskId, int attempt, String result) {
+        long acknowledgedAt = advanceNetworkDelay("RESULT_ACK", "MASTER", "WORKER" + worker.id);
+        worker.send("RESULT_ACK|" + taskId + "|" + attempt + "|" + result
+                + "|" + acknowledgedAt);
+    }
+
+    private void sendTermination(WorkerInfo worker) {
+        advanceNetworkDelay("TERMINATE", "MASTER", "WORKER" + worker.id);
+        worker.send(terminationMessage());
+    }
+
+    // 모든 종료 ACK를 반영한 동일한 최종 시각을 Worker에 전달한다.
+    private void broadcastFinalClock() {
+        long finalClock = clock.now();
+        for (WorkerInfo worker : workers.values()) {
+            if (worker.connected) worker.send("FINAL_CLOCK|" + finalClock);
         }
     }
 

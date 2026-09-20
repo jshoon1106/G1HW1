@@ -275,13 +275,12 @@ macOS와 Linux에서 직접 컴파일할 때는 프로젝트 최상위 폴더에
 
 9. 가상 시간, 로그, 종료
 
-- 실제 Thread.sleep 미사용
-- 가상 시각 권한: Master 단일 관리. Worker는 독립 Clock을 증가시키지 않고 Master 확정 시각을 수신하여 기록
-- Worker 처리시간: 작업당 랜덤 1~3초를 RESULT 처리 시 Master 가상 시각에 반영
-- 노드 간 통신: TASK 배정, RESULT 수신, P2P 이전 확인 시 Master 가상 시각에 1초 반영
+- Master가 하나의 가상 시계를 관리하며 실제 Thread.sleep은 사용하지 않는다.
+- 작업 처리 시 1~3초, 노드 간 단방향 메시지 전송 시 1초를 가상 시계에 더한다.
+- 요청과 응답은 각각 한 번의 전송으로 계산한다.
+- Worker 간 통신은 Worker가 Master에 간단히 보고하여 시간을 반영한다. 시각 동기화와 종료 후 로그 전송은 수행시간에서 제외한다.
 - TCP 텍스트 인코딩: 모든 Master-Worker 및 Worker-Worker 통신에 UTF-8 명시
 - 네트워크 제한시간: 최초 Worker 연결은 제한 없이 대기, P2P ACK 5초, 정상 종료 ACK 30초
-- RESULT_ACK, P2P_ACK, TERMINATE 메시지: 시각 증가 없는 동기화 메시지. Worker 로그 시각 확정 용도
 - Master 로그 위치: EC2 Master 실행 폴더의 Master.txt. 원격 Master 연결의 종료 단계에서 Worker1이 요청, 수신하여 Worker 로그가 저장되는 위치에 저장된다.
 - Worker 로그 위치: 사용자가 workers 명령을 실행한 로컬 폴더의 Worker1.txt~Worker4.txt.
 - 로그 형식: [clock] NODE | EVENT | STATUS | message
