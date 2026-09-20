@@ -16,6 +16,7 @@ AllDefinedLogs.txt: 로그 명세, 이벤트와 상태 코드 설명
 distributed-kv.jar: src의 Java 소스 4개를 Java 17 대상으로 컴파일한 실행 JAR
 run-workers.cmd: PowerShell 실행 정책을 변경하지 않고 자동 실행
 run-workers.ps1: Java 17과 Master 연결 확인, Worker 실행, 로그 보관 통합
+run-workers-ui.ps1: 상세 화면 선택, 출력 수집, 진행 상태 및 종료 후 로그 기반 통합 요약
 
 3. 실행 환경
 
@@ -26,7 +27,7 @@ run-workers.ps1: Java 17과 Master 연결 확인, Worker 실행, 로그 보관 �
 - Master Public IP: 32.236.94.251
 - Master 포트: 기본 5000/TCP
 - Worker P2P 포트: 6001~6004/TCP, 동일 로컬 PC의 127.0.0.1 사용
-- Worker 자동 실행 도구: Windows, macOS, Linux용 PowerShell 7(pwsh)
+- Worker 자동 실행 도구: Windows CMD 실행은 기본 Windows PowerShell 5.1 사용, macOS/Linux는 PowerShell 7(pwsh) 필요
 - EC2 관리자 도구: Windows OpenSSH Client(ssh, scp)
 - Java 프로그램과 distributed-kv.jar 자체는 Windows, macOS, Linux에서 동일하게 실행 가능
 
@@ -125,6 +126,12 @@ macOS/Linux에서 실행 경로를 확인하려면 command -v java 및 command -
 
 5. 컴파일 및 실행 방법
 
+최소 실행 방법 (PowerShell 7 없이 Java 17 이상으로 실행 가능)
+  Master PC: java -Dfile.encoding=UTF-8 -jar distributed-kv.jar master 5000
+  Worker PC: java -Dfile.encoding=UTF-8 -jar distributed-kv.jar workers <MASTER_IP> 5000
+  <MASTER_IP>는 실제 외부 Master 주소로 바꾼다. Master 실행 후 Worker 명령을 한 번 실행한다.
+  직접 실행에는 스크립트의 화면 선택, 실행별 로그 보관, 통합 요약이 적용되지 않는다.
+
 5-1. JAR 구성과 수동 컴파일
 
 distributed-kv.jar는 다음 Java 소스 4개를 Java 17 대상으로 컴파일한 결과물이다.
@@ -161,7 +168,7 @@ macOS와 Linux에서 직접 컴파일할 때는 프로젝트 최상위 폴더에
 - Master TCP 포트: `5000`
 - SSH 접속 시 키 파일 준비: `.\temp\master-node-key.pem`
 - SSH 접속 예시: `ssh -i .\temp\master-node-key.pem ec2-user@32.236.94.251`
-- macOS/Linux에서 키 파일 사용 시 권한 변경: `chmod 600 temp/master-node-key.pem
+- macOS/Linux에서 키 파일 사용 시 권한 변경: `chmod 600 temp/master-node-key.pem`
 
 Master를 직접 실행해야 하는 경우에는 Master를 구동할 PC에 distributed-kv.jar를 위치시킨 후 다음 명령을 실행한다.
 
@@ -192,9 +199,24 @@ PowerShell 7에서 통합 스크립트를 직접 실행할 수도 있다.
 2) 현재 distributed-kv.jar의 존재를 확인한다.
 3) Worker P2P 포트 6001~6004가 사용 가능한지 확인한다.
 4) EC2 Master의 5000/TCP 연결을 최대 30초 동안 확인한다.
+   연결 확인 후 '상세 로그를 화면에 표시할까요? [y/N]' 질문에 답한다.
+   y는 모든 상세 출력, n 또는 Enter는 간단한 진행 상태를 표시한다.
 5) 기존 로그를 logs/before-<실행 ID>로 이동한다.
 6) Worker 1~4를 실행한다.
-7) 완료 또는 실패 로그를 logs/<실행 ID>에 보관한다.
+7) 완료 또는 실패 로그를 logs/<실행 ID>에 복사하여 보관한다. 이번 로그는 프로젝트 폴더에도 남는다.
+8) 이번 실행 로그를 검증하여 통합 요약을 화면과 logs/<실행 ID>/summary.txt에 기록한다.
+
+상세 출력을 끄더라도 Java의 노드별 로그 기록은 동일하게 수행된다.
+실제 연결/프로그램 오류는 기본 화면에도 표시하며, 수집한 표준 출력·오류는 같은 폴더의 console.txt에 보관한다.
+기본 화면의 진행 수치는 Worker 성공 로그의 고유 작업 ID 기준이며 최대 0.5초마다 갱신한다.
+종료 요약은 Worker별 통계, Master의 P2P/재할당 횟수, 실제 경과시간과 가상 수행시간을 구분한다.
+COMPLETED는 로그 기준 고유 성공 5,000개, KV 5,000개, 성공/실패 집계 및 종료 기록을 확인한 상태이다.
+PARTIAL은 Worker 완료는 확인했으나 Master 로그가 없거나 불일치한 상태이며 정상 완료로 단정하지 않는다.
+FAILED는 프로세스 오류 또는 Worker 완료 조건 미충족이며 스크립트도 오류로 종료한다.
+검증은 저장된 로그를 대상으로 하며 모든 장애 상황이나 분산 알고리즘의 정확성을 보장하지 않는다.
+실행 중 모드 전환은 제공하지 않는다. 상세 모드는 실행 시작 시 선택한다.
+이 기능은 스크립트 실행에만 적용되며 java -jar 직접 실행은 기존 상세 출력을 유지한다.
+Java 소스/JAR, AWS 설정, 통신 규격과 종료 절차는 화면 옵션에 따라 변경되지 않는다.
 
 5-4. macOS와 Linux에서 workers 자동 실행
 
@@ -283,7 +305,8 @@ macOS와 Linux에서 직접 컴파일할 때는 프로젝트 최상위 폴더에
 - 네트워크 제한시간: 최초 Worker 연결은 제한 없이 대기, P2P ACK 5초, 정상 종료 ACK 30초
 - RESULT_ACK, P2P_ACK, TERMINATE 메시지: 시각 증가 없는 동기화 메시지. Worker 로그 시각 확정 용도
 - Master 로그 위치: EC2 Master 실행 폴더의 Master.txt. 원격 Master 연결의 종료 단계에서 Worker1이 요청, 수신하여 Worker 로그가 저장되는 위치에 저장된다.
-- Worker 로그 위치: 사용자가 workers 명령을 실행한 로컬 폴더의 Worker1.txt~Worker4.txt.
+- Worker 로그 위치: Java 직접 실행은 현재 작업 폴더, 자동 실행 스크립트는 프로젝트 폴더의 Worker1.txt~Worker4.txt.
+  스크립트 종료 후 logs/<실행 ID>/에 복사하며 프로젝트 폴더의 이번 로그도 유지한다.
 - 로그 형식: [clock] NODE | EVENT | STATUS | message
 - Worker 로그: INIT, CONNECT, RECV, PROC, QUEUE, LB 이벤트와 필수 6개 성능 지표 기록
 - Master 로그: KV 생성, 배정, 결과, 재시도, P2P KV 번호, 최종 Key-Value 5,000쌍, 총 성공·실패, Queue 거부, 전체 합계와 Worker별 통계 기록

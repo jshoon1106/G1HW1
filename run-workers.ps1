@@ -7,6 +7,7 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $projectRoot = $PSScriptRoot
+. (Join-Path $projectRoot 'run-workers-ui.ps1')
 $masterHost = "32.236.94.251"
 $masterPort = 5000
 $currentJarPath = Join-Path $projectRoot "distributed-kv.jar"
@@ -144,6 +145,9 @@ function Invoke-WorkerMain {
     }
     Write-Host "      Master 연결 확인 완료"
 
+    $detailed = Read-DetailedOutputChoice
+    Write-Host ('화면 모드: ' + $(if ($detailed) { '상세 출력' } else { '진행 상태 + 최종 요약' }))
+
     Write-Host "[5/6] 기존 실행 로그를 보관합니다."
     $logsRoot = Join-Path $projectRoot "logs"
     $previousLogDir = Join-Path $logsRoot "before-$releaseId"
@@ -151,19 +155,18 @@ function Invoke-WorkerMain {
 
     Write-Host "[6/6] Worker 1~4를 실행합니다."
     $completedLogDir = Join-Path $logsRoot $releaseId
+    $runResult = [pscustomobject]@{ ExitCode = 1; HadErrors = $true; Seconds = 0.0 }
     try {
-        Push-Location $projectRoot
-        try {
-            Invoke-CheckedCommand -FilePath $java -ArgumentList @(
-                "-Dfile.encoding=UTF-8", "-jar", $currentJarPath, "workers", $masterHost, "$masterPort"
-            )
-        } finally {
-            Pop-Location
-        }
+        $runResult = Invoke-WorkerConsole -Java $java -JarPath $currentJarPath `
+            -WorkingDirectory $projectRoot -MasterAddress $masterHost -Port $masterPort `
+            -Detailed $detailed -Destination $completedLogDir
     } finally {
         Copy-RunLogs -Destination $completedLogDir
+        $verification = Write-WorkerSummary -Directory $completedLogDir -ExitCode $runResult.ExitCode `
+            -HadErrors $runResult.HadErrors -Seconds $runResult.Seconds
     }
-    Write-Host "Worker 실행 완료. 로그 위치: $completedLogDir"
+    if ($verification -eq 'FAILED') { throw "실행 결과 확인 실패. $completedLogDir 의 로그와 summary.txt를 확인해주세요." }
+    if ($verification -eq 'PARTIAL') { Write-Host '[확인 필요] 전체 완료를 확인하지 못했습니다. Master.txt 수신 및 내용을 확인해주세요.' }
 }
 
 try {
