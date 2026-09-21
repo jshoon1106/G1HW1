@@ -40,6 +40,8 @@ class WorkerNode implements Runnable {
     private final CountDownLatch masterLogReceived = new CountDownLatch(1);
     private final CountDownLatch finalClockReceived = new CountDownLatch(1);
     private volatile boolean stopping;
+    private volatile boolean terminationReceived;
+    private boolean terminationConfirmed;
     private boolean processingEnabled;
     private volatile long masterClockMillis;
     private long workerAvailableAt;
@@ -106,7 +108,7 @@ class WorkerNode implements Runnable {
                 processLoop();
                 if (id == 1 && isRemoteMaster()) sendMaster("LOG_REQUEST");
                 sendMaster("TERMINATE_ACK");
-                awaitFinalClock();
+                terminationConfirmed = terminationReceived && awaitFinalClock();
                 synchronized (EventLogger.CONSOLE_LOCK) {
                     writeFinalStatistics();
                 }
@@ -158,9 +160,10 @@ class WorkerNode implements Runnable {
                             updateMasterClock(nonNegativeLong(p[1], "종료 시각"));
                             masterReassignments = nonNegativeInt(p[2], "장애 재할당 수");
                             masterP2pEvents = nonNegativeInt(p[3], "P2P 이벤트 수");
+                            terminationReceived = true;
                             synchronized (queueLock) {
                                 stopping = true;
-                                queue.clear();
+                                clearQueueLocked("종료 정리");
                                 queueLock.notifyAll();
                             }
                         }
@@ -194,7 +197,7 @@ class WorkerNode implements Runnable {
             if (!stopping) write("CONNECT", "FAIL", "마스터 연결 종료: " + e.getMessage());
             synchronized (queueLock) {
                 stopping = true;
-                queue.clear();
+                clearQueueLocked("연결 오류 정리");
                 queueLock.notifyAll();
             }
         }
@@ -231,12 +234,15 @@ class WorkerNode implements Runnable {
     }
 
     // 모든 Worker의 종료 ACK가 반영된 공통 최종 시각 대기
-    private void awaitFinalClock() {
+    private boolean awaitFinalClock() {
         try {
-            finalClockReceived.await(TERMINATION_CLOCK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            if (finalClockReceived.await(TERMINATION_CLOCK_TIMEOUT_SECONDS, TimeUnit.SECONDS)) return true;
+            write("TERMINATE", "FAIL", "최종 시각 수신 제한시간 초과, 정상 종료 확인 불가");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            write("TERMINATE", "FAIL", "최종 시각 대기 중단, 정상 종료 확인 불가");
         }
+        return false;
     }
 
     // 원격 Master 연결 여부 확인
@@ -287,8 +293,7 @@ class WorkerNode implements Runnable {
         synchronized (queueLock) {
             accepted = queue.size() + reservedTransferSlots < QUEUE_LIMIT;
             if (accepted) {
-                if (task.retry) queue.addFirst(task);
-                else queue.addLast(task);
+                addTaskLocked(task, task.retry, "Master 수신");
                 size = queue.size() + reservedTransferSlots;
                 received++;
                 if (task.retry) retryReceived++;
@@ -308,7 +313,6 @@ class WorkerNode implements Runnable {
         String type = task.retry ? "우선 재시도" : "일반";
         write("RECV", "INFO", "KV[" + task.id + "] " + type + " 작업 수신, 대기열="
                 + size + "/10");
-        warnIfNeeded(size);
         sendMaster("STATUS|" + size);
         checkLoadBalance();
         synchronized (queueLock) {
@@ -338,7 +342,6 @@ class WorkerNode implements Runnable {
             sendMaster("RESULT|" + task.id + "|" + task.attempts + "|"
                     + (ok ? "SUCCESS" : "FAIL") + "|"
                     + format(duration) + "|" + format(wait) + "|" + size + "|PROCESS");
-            warnIfNeeded(size);
             sendMaster("STATUS|" + size);
             checkLoadBalance();
         }
@@ -356,7 +359,7 @@ class WorkerNode implements Runnable {
                 }
             }
             if (stopping) return null;
-            return queue.pollFirst();
+            return removeTaskLocked(false, "처리 시작");
         }
     }
 
@@ -387,7 +390,7 @@ class WorkerNode implements Runnable {
             if (estimatedWait <= 15.0) return;
             int transferable = Math.min(3,
                     Math.min(queue.size(), QUEUE_LIMIT - targetLoad[1]));
-            for (int index = 0; index < transferable; index++) batch.add(queue.pollLast());
+            for (int index = 0; index < transferable; index++) batch.add(removeTaskLocked(true, "P2P 송신"));
             reservedTransferSlots += batch.size();
         }
         if (batch.isEmpty()) return;
@@ -406,11 +409,10 @@ class WorkerNode implements Runnable {
                     + "초, 조회ID=" + requestId + ", 최소 Queue 워커" + target
                     + "(" + targetLoad[1] + "/10)로 " + batch.size() + "건 이전 요청");
             int remaining = queueSize();
-            warnIfNeeded(remaining);
             sendMaster("STATUS|" + remaining);
         } else {
             synchronized (queueLock) {
-                for (int index = batch.size() - 1; index >= 0; index--) queue.addLast(batch.get(index));
+                for (int index = batch.size() - 1; index >= 0; index--) addTaskLocked(batch.get(index), false, "P2P 실패 복원");
                 reservedTransferSlots -= batch.size();
                 queueLock.notifyAll();
             }
@@ -554,7 +556,7 @@ class WorkerNode implements Runnable {
                                         <= QUEUE_LIMIT
                                         && tasks.stream().noneMatch(this::containsTaskLocked);
                                 if (accepted) {
-                                    queue.addAll(tasks);
+                                    for (Task task : tasks) addTaskLocked(task, false, "P2P 수신");
                                     acceptedTransferIds.add(transferId);
                                     received += tasks.size();
                                     for (Task task : tasks) {
@@ -571,7 +573,6 @@ class WorkerNode implements Runnable {
                                 sendMaster("P2P|RECEIVED|" + sourceId + "|" + transferId
                                         + "|" + tasks.size() + "|" + taskRefs(tasks));
                                 int size = queueSize();
-                                warnIfNeeded(size);
                                 sendMaster("STATUS|" + size);
                             } else {
                                 out.println("REJECT|Queue 여유 부족 또는 중복 작업");
@@ -602,9 +603,34 @@ class WorkerNode implements Runnable {
         }
     }
 
-    // Queue 70% 초과 경고
-    private void warnIfNeeded(int size) {
-        if (size > 7) write("QUEUE", "WARN", "대기열 70% 초과, 크기=" + size + "/10");
+    // Queue 변경과 전후 크기 기록은 같은 잠금 안에서 수행한다.
+    // 예약 슬롯은 용량 제한에만 사용하며 WARN은 실제 대기 작업 수 기준이다.
+    private void addTaskLocked(Task task, boolean first, String reason) {
+        if (!Thread.holdsLock(queueLock)) throw new IllegalStateException("Queue lock required");
+        int before = queue.size();
+        if (first) queue.addFirst(task);
+        else queue.addLast(task);
+        warnQueueChangeLocked(task, before, reason);
+    }
+
+    private Task removeTaskLocked(boolean last, String reason) {
+        if (!Thread.holdsLock(queueLock)) throw new IllegalStateException("Queue lock required");
+        int before = queue.size();
+        Task task = last ? queue.pollLast() : queue.pollFirst();
+        if (task != null) warnQueueChangeLocked(task, before, reason);
+        return task;
+    }
+
+    private void clearQueueLocked(String reason) {
+        while (!queue.isEmpty()) removeTaskLocked(false, reason);
+    }
+
+    private void warnQueueChangeLocked(Task task, int before, String reason) {
+        int after = queue.size();
+        if (before > 7 || after > 7) {
+            write("QUEUE", "WARN", "대기열 70% 초과 구간 변경, KV[" + task.id
+                    + "], 사유=" + reason + ", 크기=" + before + "->" + after + "/10");
+        }
     }
 
     // Master 메시지 전송
@@ -634,7 +660,8 @@ class WorkerNode implements Runnable {
                 + (p2pSentEvents + p2pReceivedEvents));
         write("STAT", "INFO", "장애 재할당 횟수: " + fail);
         write("STAT", "INFO", "전체 수행 시간: " + VirtualClock.format(masterClockMillis) + "초");
-        write("TERMINATE", "SUCCESS", "워커" + id + " 정상 연결 해제");
+        write("TERMINATE", terminationConfirmed ? "SUCCESS" : "FAIL",
+                "워커" + id + (terminationConfirmed ? " 정상 연결 해제" : " 불완전 종료: 정상 종료 확인 실패"));
     }
 
     // Worker 로그 출력

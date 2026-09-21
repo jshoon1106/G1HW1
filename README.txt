@@ -313,12 +313,17 @@ macOS와 Linux에서 직접 컴파일할 때는 프로젝트 최상위 폴더에
   P2P 부하 분산 이벤트 횟수, 장애 재할당 횟수, 전체 수행시간
 - 종료 조건: 고유 KV 5,000개 성공 처리 완료. 성공 완료 뒤의 중복 재시도 항목은 종료 시 폐기
 - 종료 절차: Master TERMINATE 전송, Worker 최종 통계 및 TERMINATE_ACK 전송, Master 최종 통계 기록
+- 정상 종료 판정: Master는 처리 제한시간 내 고유 작업/KV 5,000개 완료와 종료 ACK 4개 수신을 모두 확인한다.
+  제한시간 초과 시 통계는 보존하되 최종 TERMINATE는 FAIL로 기록한다.
+  Worker는 TERMINATE와 FINAL_CLOCK 수신을 확인해야 SUCCESS로 기록하며, 최종 시각 대기 초과·중단은 FAIL이다.
 
 10. 추가 구현 사항
 
 - 고유 4자리 16진수 Key 생성, Value 범위 1~100
 - Worker Ready Queue 최대 10개 제한
-- Queue 크기 70% 초과 상태에서 Queue 변경 시 WARN 로그 기록
+- Queue의 실제 작업 수가 변경 전 또는 후에 7을 초과하면 작업마다 WARN 기록(7→8, 8→7 포함).
+  P2P 묶음 송수신·실패 복원·종료 정리에도 적용하며, 전후 크기와 작업 ID·사유를 기록한다.
+  복원 예약 슬롯은 용량 제한에만 포함하고 WARN 크기에서는 제외한다.
 - Master와 Worker에 작업 처리량, 성공·실패 횟수, 평균 대기시간, P2P 부하 분산 이벤트 횟수, 장애 재할당 횟수, 전체 수행시간 기록
 - AllDefinedLogs.txt의 전체 로그 이벤트 명세 제공
 - 잘못된 필드 수·숫자·Worker ID·Task 직렬화 문자열을 PROTO WARN으로 거부

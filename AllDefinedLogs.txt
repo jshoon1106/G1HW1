@@ -23,6 +23,12 @@
   TERMINATE  정상 종료 신호, 종료 완료
 
 추가 규칙
+  QUEUE WARN은 실제 대기 작업 수의 변경 전 또는 후가 7을 초과할 때 작업마다 기록한다(7→8 및 8→7 포함).
+  P2P 묶음 송수신, 실패 복원, 종료/연결 오류 정리에도 각 작업의 전후 크기·작업 ID·사유를 기록한다.
+  P2P 복원 예약 슬롯은 용량 제한에 포함하지만 WARN의 실제 Queue 크기에는 포함하지 않는다.
+  처리 또는 종료 ACK 제한시간 초과 시 Master 최종 TERMINATE는 FAIL이며 SUCCESS로 덮어 기록하지 않는다.
+  Worker는 종료 신호와 최종 시각을 확인한 경우만 TERMINATE SUCCESS를 기록한다.
+  최종 시각 수신 제한시간 초과·대기 중단은 TERMINATE FAIL로 기록하며 실패 시에도 통계는 남긴다.
   RESULT 로그는 20% 처리 실패와 Queue 초과 거부를 구분한다.
   동일 taskId와 attempt의 중복 RESULT는 최초 1건만 반영한다.
   P2P 전송은 transferId로 중복 수신을 방지한다.

@@ -53,6 +53,7 @@ class MasterNode {
     private int nextProgress = 500;
     private int tieCursor;
     private boolean terminating;
+    private boolean completionTimedOut;
 
     // Master 포트 설정
     MasterNode(int port) {
@@ -79,13 +80,15 @@ class MasterNode {
             if (!completionSignal.await(COMPLETION_TIMEOUT_MINUTES, TimeUnit.MINUTES)) {
                 synchronized (lock) {
                     terminating = true;
+                    completionTimedOut = true;
                     write("TERMINATE", "FAIL", "전체 처리 제한시간 초과, 강제 종료 신호 전송");
                     for (WorkerInfo worker : workers.values()) {
                         if (worker.connected) sendTermination(worker);
                     }
                 }
             }
-            if (!terminationAcks.await(TERMINATION_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            boolean allTerminationAcks = terminationAcks.await(TERMINATION_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            if (!allTerminationAcks) {
                 synchronized (lock) {
                     write("TERMINATE", "WARN", "종료 ACK 제한시간 초과, 수신="
                             + (WORKER_COUNT - terminationAcks.getCount()) + "/" + WORKER_COUNT);
@@ -93,7 +96,11 @@ class MasterNode {
             }
             synchronized (lock) {
                 writeFinalStatistics();
-                write("TERMINATE", "SUCCESS", "정상 종료 완료");
+                boolean completed = !completionTimedOut
+                        && completedTaskIds.size() == TASK_COUNT && kvStore.size() == TASK_COUNT;
+                write("TERMINATE", completed && allTerminationAcks ? "SUCCESS" : "FAIL",
+                        completed && allTerminationAcks ? "정상 종료 완료"
+                                : "불완전 종료: 처리 완료=" + completed + ", 종료 ACK 완료=" + allTerminationAcks);
                 sendMasterLog();
             }
         }
@@ -211,7 +218,9 @@ class MasterNode {
                         if (!worker.terminationAcked) {
                             worker.terminationAcked = true;
                             terminationAcks.countDown();
-                            if (terminationAcks.getCount() == 0) broadcastFinalClock();
+                            if (terminationAcks.getCount() == 0 && !completionTimedOut
+                                    && completedTaskIds.size() == TASK_COUNT
+                                    && kvStore.size() == TASK_COUNT) broadcastFinalClock();
                         }
                     }
                     default -> write("PROTO", "WARN", "워커" + worker.id
