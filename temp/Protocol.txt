@@ -39,6 +39,9 @@ RESULT|taskId|attempt|SUCCESS/FAIL|duration|wait|queueSize|PROCESS/QUEUE_FULL
 P2P|SENT/RECEIVED|peerId|transferId|count|taskRefs
 P2P 작업 전송 또는 수신 결과 보고. taskRefs 형식은 taskId:attempt 목록이다.
 
+NET|messageType|sourceWorkerId|targetWorkerId
+Worker 간 단방향 메시지 1건을 Master System Clock에 반영한다.
+
 TERMINATE_ACK
 종료 완료 응답
 
@@ -61,6 +64,10 @@ P2P 결과 확인 및 확정 가상 시각 전달
 
 TERMINATE|masterClockMillis|faultReassignments|p2pEvents
 정상 종료 요청과 최종 가상 시각, 전체 장애 재할당 수, 전체 P2P 이전 이벤트 수 전달
+
+FINAL_CLOCK|masterClockMillis
+모든 TERMINATE_ACK의 통신 지연까지 반영된 공통 최종 가상 시각 전달.
+시각 동기화용이므로 별도 지연은 부과하지 않는다.
 
 REJECT|reason
 Worker 등록 거부
