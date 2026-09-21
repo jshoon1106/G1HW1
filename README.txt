@@ -1,330 +1,287 @@
 분산 환경 Fault-Tolerant 키-값 저장소
 
-1. 조원 정보
+1. 프로그램 개요 및 조원 정보
 
-조원 1: 20223134 장승훈 - 전체 초기 구현, Master·AWS 구축
-조원 2: 20213132 정우진 - Worker 실행·로그·UX 개선, README 보완
-조원 3: 20223099 김현중 - 시연 영상
+Master 1개와 Worker 4개가 TCP Socket으로 통신하며 고유 Key-Value 작업 5,000개를 처리한다.
+Master는 AWS EC2 외부 서버에서, Worker 4개는 한 로컬 PC의 독립 Thread로 실행한다.
+Key는 고유한 4자리 16진수, Value는 1~100의 정수이다. Worker는 최대 10개의 Ready Queue,
+80% 성공/20% 실패 시뮬레이션, 실패 재할당과 P2P 부하 분산에 참여한다.
 
-2. 프로그램 구성요소
+- 20223134 장승훈: 전체 초기 구현, Master·AWS 구축
+- 20213132 정우진: Worker 실행·로그·UX 개선, README 보완
+- 20223099 김현중: 시연 영상
 
-src/DistributedKvApp.java: 실행 진입점, master 또는 workers 역할 선택
-src/MasterNode.java: Master Node, Worker 연결 수락, KV 생성, 동적 배정, 재시도, 통계, 종료
-src/WorkerNode.java: Worker Node, Worker Thread 4개, Ready Queue, 작업 처리, P2P 이전, Worker 로그
-src/Shared.java: 공통 구성요소, Task, VirtualClock, EventLogger, WorkerInfo
-AllDefinedLogs.txt: 로그 명세, 이벤트와 상태 코드 설명
-distributed-kv.jar: src의 Java 소스 4개를 Java 17 대상으로 컴파일한 실행 JAR
-run-workers.cmd: PowerShell 실행 정책을 변경하지 않고 자동 실행
-run-workers.ps1: Java 17과 Master 연결 확인, Worker 실행, 로그 보관 통합
-run-workers-ui.ps1: 상세 화면 선택, 출력 수집, 진행 상태 및 종료 후 로그 기반 통합 요약
+2. 파일 구성
 
-3. 실행 환경
+src/DistributedKvApp.java: master/workers 역할을 선택하는 실행 진입점
+src/MasterNode.java: 작업 생성·배정, 가상 시계, 결과·재시도·통계·종료 관리
+src/WorkerNode.java: Worker Thread, Queue, 작업 처리, P2P 통신, Worker 로그
+src/Shared.java: Task, VirtualClock, EventLogger, WorkerInfo 등 공통 구성요소
+launcher/WorkerLauncher.java: 연결 검사·화면 제어·로그 보관·통합 요약의 공통 도우미
 
-- 언어: Java 17
-- 소스 컴파일 및 JAR 생성: JDK 17 이상(javac, jar 포함)
-- Master 실행 환경: AWS EC2 Amazon Linux 2023
-- Worker 실행 환경: Windows, macOS, Linux 로컬 PC
-- Master Public IP: 32.236.94.251
-- Master 포트: 기본 5000/TCP
-- Worker P2P 포트: 6001~6004/TCP, 동일 로컬 PC의 127.0.0.1 사용
-- Worker 자동 실행 도구: Windows CMD 실행은 기본 Windows PowerShell 5.1 사용, macOS/Linux는 PowerShell 7(pwsh) 필요
-- EC2 관리자 도구: Windows OpenSSH Client(ssh, scp)
-- Java 프로그램과 distributed-kv.jar 자체는 Windows, macOS, Linux에서 동일하게 실행 가능
+distributed-kv.jar: 분산 프로그램 실행 파일 (Java 17 대상)
+worker-launcher.jar: 편의 실행 도우미 (Java 17 대상, 위 JAR를 자식 프로세스로 실행)
+run-workers.cmd: Windows 더블클릭 실행 및 종료 후 창 유지
+run-workers.ps1: Java 검사 후 도우미 실행 (Windows 기본 PowerShell 5.1 또는 PowerShell 7)
+run-workers.sh: Linux/macOS Bash에서 Java 검사 후 같은 도우미 실행
+AllDefinedLogs.txt: EVENT·STATUS 및 통계 정의
+Master.txt, Worker1.txt~Worker4.txt: 결과 로그
+logs/: 편의 실행 시 실행별 로그 보관 폴더
+tests/: 개발용 검증 코드
+run-master.ps1: AWS 관리자용 배포·실행 관리 도구 (일반 Worker 실행에는 불필요)
 
-4. 사전 작업
+실행 스크립트와 두 JAR는 프로젝트 최상위 폴더에 함께 둔다.
 
-4-1. 공통 준비사항
+3. 사전 준비
 
-- 개발 기준은 JDK 17이다. JDK에는 java(실행), javac(컴파일), jar(JAR 생성)가 포함된다.
-- 아래 빌드 명령은 --release 17을 사용한다. 실행 스크립트는 Java 17 이상을 허용한다.
-- JAR 실행만 할 때는 javac가 필요하지 않지만, 소스 컴파일을 위해서는 JDK가 필요하다.
-- JAVA_HOME은 JDK 설치 폴더, PATH는 실행 파일을 찾을 폴더 목록이다.
-  JAVA_HOME에는 bin을 제외한 경로를, PATH에는 JDK의 bin 경로를 추가한다.
-- 기존 PATH 전체를 지우거나 덮어쓰지 않는다. 설치 후 터미널을 새로 연다.
+3-1. 공통
 
-4-2. Windows
+- JAR 실행: Java 17 이상 실행 환경 필요. javac는 필요하지 않다.
+- 소스 컴파일: javac와 jar가 포함된 JDK 17 이상 필요. 빌드는 --release 17을 사용한다.
+- JAVA_HOME은 JDK 설치 폴더(bin 제외), PATH에는 해당 폴더의 bin을 추가한다.
+- 기존 PATH를 덮어쓰지 않는다. 설치·환경변수 변경 후 터미널을 새로 연다.
+- 실행 스크립트는 JAVA_HOME, PATH 순으로 사용 가능한 Java 17 이상을 찾는다.
+- Python, 추가 패키지, Java 자동 설치는 사용하지 않는다.
 
-1) https://adoptium.net/temurin/releases/?version=17 에서 Windows용 JDK 17 MSI를 설치한다.
-   PC 아키텍처에 맞는 파일을 선택한다. 설치 옵션에서 PATH 추가 및 JAVA_HOME 설정을 선택할 수 있다.
-2) 자동 설정되지 않았다면 Windows 검색에서 '시스템 환경 변수 편집' -> '환경 변수'를 연다.
-   사용자 변수 JAVA_HOME을 만들고 실제 JDK 설치 폴더를 입력한다.
-   예: C:\Program Files\Eclipse Adoptium\<설치된 JDK 17 폴더명>
-   사용자 변수 Path에 %JAVA_HOME%\bin 항목을 추가한다.
-   꺾쇠 안의 폴더명은 실제 설치 폴더명으로 바꾸며, 경로 값에 따옴표를 넣지 않는다.
-3) 새 PowerShell 또는 명령 프롬프트에서 확인한다.
+3-2. Windows
 
-   java -version
-   javac -version
-   jar --version
-
-   JDK 17을 설치했다면 모두 17로 시작해야 한다. 다른 버전이 선택되면 다음 명령으로 경로를 확인한다.
-
-   where.exe java
-   where.exe javac
-
-4-3. macOS (기본 zsh 기준)
-
-1) 위 Temurin 다운로드 페이지에서 macOS용 JDK 17 PKG를 설치한다.
-   Apple Silicon은 aarch64, Intel Mac은 x64를 선택한다.
-2) ~/.zshrc에 아래 내용을 추가한다. 기존 Java 설정이 있다면 중복 추가 대신 수정한다.
-
-   export JAVA_HOME=$(/usr/libexec/java_home -v 17)
-   export PATH="$JAVA_HOME/bin:$PATH"
-
-3) 설정을 적용하고 확인한다.
-
-   source ~/.zshrc
-   java -version
-   javac -version
-   jar --version
-
-4-4. Linux
-
-배포판에 맞는 설치 명령을 사용한다.
-
-Ubuntu 22.04/24.04:
-   sudo apt update
-   sudo apt install openjdk-17-jdk
-
-Amazon Linux 2023 (AWS Master):
-   sudo yum install java-17-amazon-corretto-devel
-
-설치 후 아래 명령으로 javac 버전과 실제 경로를 확인한다.
-
-   javac -version
-   readlink -f "$(command -v javac)"
-
-javac가 17 버전인지 확인한다. 다른 버전이면 배포판의 alternatives 설정에서 JDK 17을 선택하거나
-설치된 JDK 17 폴더를 직접 확인한다. 출력 경로의 마지막 /bin/javac를 제외한 부분이 JDK 폴더이다.
-Bash 사용자는 ~/.bashrc에 다음을 추가한다. <JDK 17 설치 경로>는 실제 경로로 바꾼다.
-
-   export JAVA_HOME="<JDK 17 설치 경로>"
-   export PATH="$JAVA_HOME/bin:$PATH"
-
-   source ~/.bashrc
-   java -version
-   javac -version
-   jar --version
-
-zsh 사용자는 ~/.zshrc에 설정하고 source ~/.zshrc로 적용한다.
-macOS/Linux에서 실행 경로를 확인하려면 command -v java 및 command -v javac를 사용한다.
-
-4-5. 검사 및 문제 해결
-
-- java를 찾을 수 없음: 미설치 또는 PATH 설정 문제일 수 있다. JDK 설치 위치와 환경변수를 확인한다.
-- java만 되고 javac가 안 됨: JDK 설치 여부와 JDK의 bin 경로를 확인한다.
-- run-workers.ps1은 운영체제와 관계없이 JAVA_HOME, PATH 순서로 Java를 찾는다.
-- macOS/Linux에서 실행 경로를 확인하려면 command -v java 및 command -v pwsh를 사용한다.
-- 자동 설치, 시스템 환경변수 변경은 하지 않는다. Windows CMD는 자식 PowerShell 프로세스에만
-  ExecutionPolicy Bypass를 적용하며 저장된 실행 정책은 변경하지 않는다. 조직의 그룹 정책은 우회하지 않는다.
-- 현재 실행 스크립트에는 환경만 검사하는 -CheckOnly 또는 --check 옵션이 없다.
-
-설치 참고 문서:
-   https://adoptium.net/installation
-   https://docs.oracle.com/en/java/javase/17/install/installation-guide.pdf
-   https://docs.aws.amazon.com/corretto/latest/corretto-17-ug/amazon-linux-install.html
-
-5. 컴파일 및 실행 방법
-
-최소 실행 방법 (PowerShell 7 없이 Java 17 이상으로 실행 가능)
-  Master PC: java -Dfile.encoding=UTF-8 -jar distributed-kv.jar master 5000
-  Worker PC: java -Dfile.encoding=UTF-8 -jar distributed-kv.jar workers <MASTER_IP> 5000
-  <MASTER_IP>는 실제 외부 Master 주소로 바꾼다. Master 실행 후 Worker 명령을 한 번 실행한다.
-  직접 실행에는 스크립트의 화면 선택, 실행별 로그 보관, 통합 요약이 적용되지 않는다.
-
-5-1. JAR 구성과 수동 컴파일
-
-distributed-kv.jar는 다음 Java 소스 4개를 Java 17 대상으로 컴파일한 결과물이다.
-
-  src/DistributedKvApp.java
-  src/MasterNode.java
-  src/Shared.java
-  src/WorkerNode.java
-
-JAR에는 Java 소스 원본이 아니라 위 소스에서 생성된 .class 파일과 내부 클래스 파일이 들어간다.
-실행 진입점은 DistributedKvApp이다.
-
+Temurin 등 JDK 17을 설치한다. 설치 시 PATH/JAVA_HOME 설정 옵션을 사용할 수 있다.
+자동 설정되지 않았다면 '시스템 환경 변수 편집 → 환경 변수'에서 사용자 변수를 설정한다.
+  JAVA_HOME: C:\Program Files\Eclipse Adoptium\<실제 JDK 설치 폴더>
+  Path에 추가: %JAVA_HOME%\bin
+경로 값에 따옴표를 넣지 않는다. 새 PowerShell에서 확인한다.
+  java -version
   javac -version
+  jar --version
+다른 Java가 선택되면 where.exe java, where.exe javac로 경로를 확인한다.
 
-Windows에서는 PowerShell에서 프로젝트 최상위 폴더로 이동한 뒤 다음 명령을 실행한다.
+3-3. macOS
 
+PC 아키텍처에 맞는 JDK 17을 설치한다(Apple Silicon: aarch64, Intel: x64).
+기본 zsh 환경에서는 ~/.zshrc에 다음을 추가하고 적용한다.
+  export JAVA_HOME=$(/usr/libexec/java_home -v 17)
+  export PATH="$JAVA_HOME/bin:$PATH"
+  source ~/.zshrc
+  java -version
+  javac -version
+  jar --version
+
+3-4. Linux
+
+Ubuntu:
+  sudo apt update
+  sudo apt install openjdk-17-jdk
+Amazon Linux 2023:
+  sudo yum install java-17-amazon-corretto-devel
+
+설치된 JDK의 위치는 다음으로 확인한다.
+  javac -version
+  readlink -f "$(command -v javac)"
+출력의 /bin/javac 앞까지가 JDK 폴더이다. 다른 버전이 선택되면 JDK 17 경로를 확인한다.
+Bash의 ~/.bashrc에 다음을 설정한다(zsh는 ~/.zshrc).
+  export JAVA_HOME="<실제 JDK 설치 경로>"
+  export PATH="$JAVA_HOME/bin:$PATH"
+  source ~/.bashrc
+  java -version
+  javac -version
+  jar --version
+
+java를 못 찾으면 설치 및 PATH를, java만 되고 javac가 없으면 JDK 설치 및 경로를 확인한다.
+macOS/Linux의 경로 확인은 command -v java, command -v javac를 사용한다.
+JDK 다운로드 참고: https://adoptium.net/temurin/releases/?version=17
+
+4. 컴파일 및 실행
+
+4-1. 직접 컴파일 (프로젝트 폴더에서 실행)
+
+Windows PowerShell:
   New-Item -ItemType Directory -Path out -Force | Out-Null
   javac --release 17 -encoding UTF-8 -d out src/DistributedKvApp.java src/MasterNode.java src/Shared.java src/WorkerNode.java
   jar cfe distributed-kv.jar DistributedKvApp -C out .
 
-macOS와 Linux에서 직접 컴파일할 때는 프로젝트 최상위 폴더에서 다음 명령을 사용한다.
-
+Linux/macOS:
   mkdir -p out
   javac --release 17 -encoding UTF-8 -d out src/*.java
   jar cfe distributed-kv.jar DistributedKvApp -C out .
 
-컴파일이 성공하면 프로젝트 최상위 폴더에 distributed-kv.jar가 생성된다. /out 폴더는 수동 컴파일용 중간 결과이며 JAR 실행에는 필요하지 않다.
+out은 빌드 중간 결과이며 실행할 때 필요하지 않다.
 
-5-2. Master 접속 정보, Workers 실행
+4-2. Master 직접 실행
 
-5-2-1. Master 접속 정보
-
-- Master Public IP: `32.236.94.251`
-- Master TCP 포트: `5000`
-- SSH 접속 시 키 파일 준비: `.\temp\master-node-key.pem`
-- SSH 접속 예시: `ssh -i .\temp\master-node-key.pem ec2-user@32.236.94.251`
-- macOS/Linux에서 키 파일 사용 시 권한 변경: `chmod 600 temp/master-node-key.pem`
-
-Master를 직접 실행해야 하는 경우에는 Master를 구동할 PC에 distributed-kv.jar를 위치시킨 후 다음 명령을 실행한다.
-
+AWS EC2 등 외부 서버에 distributed-kv.jar를 두고 실행한다.
   java -Dfile.encoding=UTF-8 -jar distributed-kv.jar master 5000
+현재 팀 Master 주소는 32.236.94.251:5000이다. Master는 작업 생성 후 Worker 4개의 연결을
+기다리고 배정을 시작한다. 서버 자동 재시작은 Java 기능이 아닌 AWS의 별도 실행 설정이다.
 
-5-2-2. Workers 실행
+4-3. Worker 직접 실행
 
-Master의 Public IP를 입력하여 로컬 PC에서 실행한다. Java 17 이상이 설치되어 있으면 macOS와 Linux에서도 실행할 수 있다.
+로컬 PC에서 실행한다. <MASTER_IP>는 실제 Master 주소로 바꾼다.
+  java -Dfile.encoding=UTF-8 -jar distributed-kv.jar workers <MASTER_IP> 5000
+한 번의 명령이 Worker Thread 4개와 P2P 포트 6001~6004를 생성한다.
+직접 실행은 상세 콘솔 출력과 현재 작업 폴더의 로그 기록을 사용한다.
+편의 도구의 출력 선택·실행별 보관·통합 요약은 적용되지 않는다.
 
-  java -Dfile.encoding=UTF-8 -jar distributed-kv.jar workers 32.236.94.251 5000
+4-4. Worker 편의 실행
 
-하나의 Worker 실행 명령은 Worker 1~4의 독립 Thread와 P2P 수신 포트 6001~6004를 생성한다.
-Worker 실행이 끝나면 현재 로컬 폴더에 Worker1.txt~Worker4.txt가 생성된다. Master 주소가 원격 주소이면 Worker1은 종료 단계에서 TCP로 Master.txt를 수신하여 같은 로컬 폴더에 저장한다.
-
-5-3. Windows에서 workers 자동 실행
-
-프로젝트 최상위 폴더에서 다음 파일을 실행한다. 실행 전 EC2 Master가 이미 실행 중이고 5000/TCP에서 연결을 받아야 한다.
-
+Windows:
   .\run-workers.cmd
+  .\run-workers.cmd -MasterHost <MASTER_IP> -Port 5000
+PowerShell 직접 실행:
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\run-workers.ps1
+PowerShell 7은 powershell 대신 pwsh를 사용한다. -NoPause를 추가하면 종료 후 대기를 생략한다.
+CMD는 자식 PowerShell에만 실행 정책 Bypass를 적용하며 시스템 설정을 바꾸지 않는다.
 
-PowerShell 7에서 통합 스크립트를 직접 실행할 수도 있다.
+Linux/macOS (PowerShell 불필요):
+  bash ./run-workers.sh
+  bash ./run-workers.sh <MASTER_IP> 5000
 
-  pwsh -NoProfile -ExecutionPolicy Bypass -File .\run-workers.ps1
+주소 생략 시 32.236.94.251:5000을 사용한다. Java/JAR·P2P 포트·Master 연결을 검사한 뒤
+'상세 로그를 화면에 표시할까요? [y/N]'에 답한다. y는 상세 출력, n 또는 Enter는 진행 상태를
+표시한다. 오류는 두 모드 모두 표시하며 실행 중 모드 전환은 제공하지 않는다.
+Master 연결 확인은 최대 30초 대기한다. 연결 검사 요청은 Worker ID를 등록하지 않는다.
+CMD와 대화형 Bash 실행은 종료 후 Enter를 기다린다. Bash에 입력을 파이프로 전달하면 추가 대기는 없다.
 
-실행 순서
+편의 실행은 프로젝트 폴더에서 Java를 실행한다. 기존 로그는 logs/before-<실행 ID>/에 보관하고,
+이번 로그는 프로젝트 폴더에 유지하면서 logs/<실행 ID>/에 복사한다.
+전체 콘솔 출력은 console.txt, 통합 요약은 summary.txt로 해당 실행별 폴더에 저장한다.
 
-1) Java Runtime 17 이상을 자동 탐색한다.
-2) 현재 distributed-kv.jar의 존재를 확인한다.
-3) Worker P2P 포트 6001~6004가 사용 가능한지 확인한다.
-4) EC2 Master의 5000/TCP 연결을 최대 30초 동안 확인한다.
-   연결 확인 후 '상세 로그를 화면에 표시할까요? [y/N]' 질문에 답한다.
-   y는 모든 상세 출력, n 또는 Enter는 간단한 진행 상태를 표시한다.
-5) 기존 로그를 logs/before-<실행 ID>로 이동한다.
-6) Worker 1~4를 실행한다.
-7) 완료 또는 실패 로그를 logs/<실행 ID>에 복사하여 보관한다. 이번 로그는 프로젝트 폴더에도 남는다.
-8) 이번 실행 로그를 검증하여 통합 요약을 화면과 logs/<실행 ID>/summary.txt에 기록한다.
+4-5. WorkerLauncher 빌드 (JDK 17 이상, 실행만 할 때는 불필요)
 
-상세 출력을 끄더라도 Java의 노드별 로그 기록은 동일하게 수행된다.
-실제 연결/프로그램 오류는 기본 화면에도 표시하며, 수집한 표준 출력·오류는 같은 폴더의 console.txt에 보관한다.
-기본 화면의 진행 수치는 Worker 성공 로그의 고유 작업 ID 기준이며 최대 0.5초마다 갱신한다.
-종료 요약은 Worker별 통계, Master의 P2P/재할당 횟수, 실제 경과시간과 가상 수행시간을 구분한다.
-COMPLETED는 로그 기준 고유 성공 5,000개, KV 5,000개, 성공/실패 집계 및 종료 기록을 확인한 상태이다.
-PARTIAL은 Worker 완료는 확인했으나 Master 로그가 없거나 불일치한 상태이며 정상 완료로 단정하지 않는다.
-FAILED는 프로세스 오류 또는 Worker 완료 조건 미충족이며 스크립트도 오류로 종료한다.
-검증은 저장된 로그를 대상으로 하며 모든 장애 상황이나 분산 알고리즘의 정확성을 보장하지 않는다.
-실행 중 모드 전환은 제공하지 않는다. 상세 모드는 실행 시작 시 선택한다.
-이 기능은 스크립트 실행에만 적용되며 java -jar 직접 실행은 기존 상세 출력을 유지한다.
-Java 소스/JAR, AWS 설정, 통신 규격과 종료 절차는 화면 옵션에 따라 변경되지 않는다.
+Windows PowerShell:
+  New-Item -ItemType Directory -Path launcher-out -Force | Out-Null
+  javac --release 17 -encoding UTF-8 -d launcher-out launcher/WorkerLauncher.java
+  jar cfe worker-launcher.jar WorkerLauncher -C launcher-out .
 
-5-4. macOS와 Linux에서 workers 자동 실행
+Linux/macOS:
+  mkdir -p launcher-out
+  javac --release 17 -encoding UTF-8 -d launcher-out launcher/WorkerLauncher.java
+  jar cfe worker-launcher.jar WorkerLauncher -C launcher-out .
 
-PowerShell 7이 설치되어 있으면 Windows와 동일한 포트 검사와 로그 보관 절차를 포함한 run-workers.ps1을 실행할 수 있다.
+launcher-out에는 도우미 클래스만 빌드한다. 도우미 UX 변경 시 worker-launcher.jar를 재빌드한다.
+분산 프로그램 변경 시 distributed-kv.jar를 재빌드하고 AWS Master와 Worker 버전을 맞춘다.
+worker-launcher.jar는 Worker PC용이며 AWS Master에 배포할 필요가 없다.
 
-  pwsh -NoProfile -File ./run-workers.ps1
+5. 동적 작업 분배 알고리즘
 
-실행 전에 로컬 P2P 포트 6001~6004가 비어 있어야 한다. 이 명령 하나가 Worker 1~4를 모두 생성하므로 Worker별로 네 번 실행하지 않는다.
+알고리즘: 재시도 우선·최소 Ready Queue 우선 배정, 동률 순환 선택
 
-macOS와 Linux에서 직접 컴파일할 때는 프로젝트 최상위 폴더에서 다음 명령을 사용한다.
+1) 재시도 Queue 작업을 일반 작업보다 먼저 선택한다. 재시도끼리는 시도 횟수가 높은 순,
+   동률이면 Task ID가 작은 순으로 선택한다.
+2) 연결되어 있고 예상 Queue 크기가 10 미만인 Worker만 후보로 선택한다.
+3) 최소 Queue 후보를 Worker ID 오름차순으로 정렬하고 전역 순환 커서로 선택한다.
+4) TASK 전송 전에 예상 Queue 크기를 증가시키고 STATUS/RESULT 수신 시 보고 값으로 갱신한다.
+5) 재할당은 직전 실패 Worker를 제외한다. 초기 배정 후 START를 보내 처리를 활성화한다.
 
-  mkdir -p out
-  javac --release 17 -encoding UTF-8 -d out src/*.java
-  jar cfe distributed-kv.jar DistributedKvApp -C out .
+장점: Queue 여유 기반 분산, 가득 찬 Worker 배정 중단, 실패 작업 우선 처리.
+단점: 보고 지연에 따른 Queue 불일치 가능성, 실제 CPU/네트워크 성능 미반영.
+작업 처리량은 최종 통계에 기록하며 실시간 배정 점수에는 직접 사용하지 않는다.
 
-6. 동적 작업 분배 알고리즘
+6. P2P 부하 분산 알고리즘
 
-6-1. 알고리즘명: 재시도 우선·최소 Ready Queue 우선 배정, 동률 Worker ID 순환 선택
+알고리즘: 최소 Ready Queue 조회 기반 후단 작업 이전
 
-1) Master는 재시도 Queue를 일반 작업보다 먼저 선택한다. 재시도 작업끼리는 시도 횟수가 높은 작업을 우선하고, 동률이면 Task ID가 작은 작업을 선택한다.
-2) 연결 상태이며 예상 Queue 크기가 10 미만인 Worker만 후보로 선택한다.
-3) 후보 중 예상 Queue 크기가 가장 작은 Worker를 선택한다.
-4) 동률이면 Worker ID 오름차순 후보 목록에 전역 순환 커서를 적용해 선택한다.
-5) Master는 TASK 전송 전에 선택 Worker의 예상 Queue 크기를 1 증가시킨다.
-6) Worker의 STATUS와 RESULT 메시지를 수신하면 Master의 예상 Queue 크기를 실제 값으로 갱신한다.
-7) 재시도 작업은 직전에 실패한 Worker를 후보에서 제외하고 다른 Worker에 배정한다.
-8) 초기 Queue 배정이 끝나면 START 메시지를 모든 Worker에 전송해 처리 Thread를 동시에 활성화한다.
+1) Master 가상 시각 기준으로 다음 점검 시각을 1~3초 뒤로 정한다.
+   작업 수신·처리 과정에서 해당 시각 도달 여부를 검사한다. 별도의 실시간 주기 타이머는 아니다.
+2) 실제 Ready Queue 작업 수 × 평균 처리시간 2초가 15초를 초과하면 부하 분산을 시도한다.
+3) 다른 Worker 3개에 TCP로 Queue 상태를 조회하고, 여유가 있는 최소 Queue Worker를 선택한다.
+4) 대상 여유 공간 안에서 Queue 후단의 최대 3개 작업을 선택한다. ACK 대기 중 복원 공간을 예약한다.
+5) 수신 측이 용량을 재확인하여 수락 시 삽입 후 ACK, 거절 시 REJECT를 보낸다.
+6) ACK 수신 시 예약을 해제한다. 같은 transferId로 재시도한 뒤에도 확인되지 않거나 REJECT되면
+   TRANSFER_STATUS로 수신 측 상태를 확인한다. ACCEPTED이면 복원하지 않고 이전을 확정한다.
+7) NOT_FOUND/REJECTED는 수신 측이 해당 ID의 향후 전송도 거절하도록 취소를 확정한 응답이다.
+   이 응답을 받은 경우에만 작업을 복원한다. 늦게 도착한 동일 ID의 TRANSFER는 거절한다.
+8) 조회마저 실패하면 UNKNOWN으로 취급하여 복원하지 않고 예약을 유지하며 별도 Thread에서 재조회한다.
+   종료까지 소유권이 확인되지 않으면 Worker 최종 종료를 FAIL로 기록한다.
 
-작업 처리량은 배정 점수에 직접 사용하지 않고, Worker별 최종 통계로 기록한다. 따라서
-현재 구현의 실시간 배정 기준은 연결 상태, Queue 여유, 재시도 우선순위, Worker ID 순환이다.
+장점: Worker끼리 직접 분산, 수신 용량 재확인, 현재 Queue 상태를 반영한 대상 선택.
+단점: 추가 조회 비용, 조회와 이전 사이 상태 변경에 따른 REJECT 가능성.
+transferId는 동일 이전 요청의 재수신에 의한 중복 Queue 삽입을 방지한다.
+단, 모든 네트워크 장애에 대한 exactly-once 전달을 보장하는 프로토콜은 아니다.
+ACK 유실 뒤 즉시 복원하던 경로는 상태 확인과 취소 확정으로 대체했다.
+전송 상태는 해당 Worker 프로세스의 메모리에 유지된다. 프로세스 재시작·상태 소실까지 복구하는
+영속 소유권 프로토콜은 아니며, 지속적인 통신 단절 시 안전한 완료를 보장하지 않는다.
+P2P 통신은 동일 PC의 127.0.0.1:6001~6004를 사용한다.
 
-장점
+7. 장애 처리 및 Ready Queue
 
-- 구현 단순성, Queue 길이 기반 작업 분산
-- 과부하 Worker 배정 방지
-- 재시도 작업의 우선 처리
+- 작업은 매 시도 80% 성공/20% 실패 확률을 적용한다. 실패는 RESULT FAIL로 보고한다.
+- Master는 실패 작업을 Priority Retry Queue에 넣고 다른 Worker에 우선 재할당한다.
+  재시도에도 같은 성공 확률을 적용하며 성공할 때까지 반복한다(전체 처리 제한시간 적용).
+- Worker 연결 해제 시 Master는 해당 Worker의 미완료 작업을 재시도 Queue에 복구한다.
+- Master는 taskId + attempt로 중복 결과를 걸러내고, 이미 완료된 taskId도 중복 집계하지 않는다.
+- 실제 Queue와 P2P 복원 예약 슬롯을 합쳐 최대 10개 용량을 적용한다.
+  초과 작업은 FAIL로 보고하며, 처리 실패와 Queue 초과 거부/재시도 통계는 구분한다.
+- WARN은 실제 Queue 작업 수의 변경 전 또는 후가 7을 초과하면 작업마다 기록한다.
+  7→8, 8→9, 9→10, 10→9, 9→8, 8→7은 WARN이며 7→6은 아니다.
+- P2P 묶음 송수신·실패 복원·종료/연결 오류 정리에도 작업별 기준을 적용한다.
+  Queue 변경과 기록을 같은 잠금 안에서 처리하며 Task ID·사유·전후 크기를 남긴다.
+  예약 슬롯은 용량 검사에만 포함하고 WARN의 실제 Queue 크기에서는 제외한다.
 
-단점
+8. 가상 System Clock 및 종료
 
-- 실제 CPU 성능, 네트워크 품질, 처리시간 차이 미반영
-- Worker 상태 메시지 지연 시 일시적 Queue 상태 불일치 가능
+8-1. 시간 계산
 
-7. P2P 부하 분산 알고리즘
+Master가 전역 가상 시계를 관리한다. 작업 처리 1~3초와 노드 간 단방향 메시지 지연 1초를
+누적하며 요청과 응답은 각각 계산한다. Worker 간 직접 통신은 Worker가 Master에 보고한다.
+시각 동기화 및 종료 후 로그 파일 전달은 수행시간에서 제외한다.
+시뮬레이션 시간을 실제 Thread.sleep으로 기다리지 않는다. 실행 도우미의 연결 재시도·출력 갱신
+대기는 별도 실제 시간이며 가상 System Clock에 영향을 주지 않는다.
 
-7-1. 알고리즘명: P2P 최소 Ready Queue 조회 기반 후단 작업 이전
+8-2. 전체 종료 흐름
 
-1) Worker는 Master 가상 시간 기준 1~3초 랜덤 주기로 부하를 확인한다.
-2) 예상 대기시간은 Ready Queue 작업 수 x 평균 처리시간 2초로 계산한다.
-3) 예상 대기시간이 15초를 초과하면 다른 Worker 3개에 현재 Queue 크기를 P2P 소켓으로 조회한다.
-4) 응답한 Worker 중 Queue가 가장 작고 여유 공간이 있는 Worker를 대상으로 선택한다.
-5) 송신 Worker는 대상 여유 공간 안에서 Queue 후단 작업 최대 3개를 선택하고, ACK 대기 중 복구 공간을 예약한다.
-6) 수신 Worker가 실제 Queue 여유 공간을 다시 확인한 후 ACK 또는 REJECT를 전송한다.
-7) 각 이전에 transferId를 부여하여 ACK 재전송 시 같은 작업이 중복 삽입되지 않게 한다.
-8) ACK 수신 시 예약 공간을 해제하고 이전을 완료한다. REJECT 또는 연결 실패 시 예약 공간에 작업을 복구한다.
+고유 성공 taskId 5,000개와 KV 저장소 5,000개를 모두 확인하면 Master가 TERMINATE를 전송한다.
+Worker는 처리 루프를 종료하고, 원격 Master 사용 시 Worker1이 LOG_REQUEST를 보낸다.
+각 Worker는 TERMINATE_ACK를 보낸 뒤 FINAL_CLOCK을 기다리고, 수신 확인 후 최종 통계를 기록한다.
+Master는 처리 완료 조건과 ACK 4개를 확인하여 FINAL_CLOCK을 전송하고 자신의 최종 통계와
+종료 결과를 기록한다. 요청한 Worker1에는 Master.txt를 전달한다.
+Worker 통계 기록과 Master 통계 기록은 병렬로 진행될 수 있다.
 
-장점
+Master는 처리 제한시간 내 완료 조건과 ACK 수신을 모두 충족해야 TERMINATE SUCCESS를 기록한다.
+전체 처리 제한시간(5분) 또는 종료 ACK 제한시간(30초) 초과 시 통계는 남기되 최종 종료는 FAIL이다.
+Worker도 TERMINATE와 FINAL_CLOCK을 확인해야 SUCCESS이며 최종 시각 대기(30초) 초과·중단은 FAIL이다.
+최초 Worker 연결 수락은 별도의 전체 연결 대기 제한 없이 기다린다. P2P 소켓 제한시간은 5초이다.
 
-- Master를 거치지 않는 직접 부하 분산
-- 현재 Queue 상태를 반영한 대상 선택
-- transferId와 ACK 기반 이전 확인으로 작업 유실·중복 방지
+9. 로그 및 필수 성능 지표
 
-단점
+로그 형식: [clock] NODE | EVENT | STATUS | message
+STATUS: INFO / SUCCESS / FAIL / WARN. EVENT와 통계 정의는 AllDefinedLogs.txt를 참조한다.
 
-- Queue 조회를 위한 추가 P2P 연결 비용 발생
-- 조회 직후 Queue 상태가 바뀌면 수신 단계에서 REJECT될 수 있음
+Master 및 Worker의 최종 STAT에 필수 6개 지표를 기록한다.
+1) 작업 처리량: 성공적으로 처리한 KV 수
+2) 성공/실패 횟수: 성공과 20% 처리 실패를 별도 줄로 기록
+3) 평균 작업 대기시간: Queue 입장 후 처리 시작까지의 평균 가상 시간
+4) P2P 부하 분산 이벤트 횟수: 이전 작업 수와 구분
+5) 장애 재할당 횟수
+6) 전체 수행시간: 가상 System Clock 기준
 
-8. 장애 처리 메커니즘
+Worker의 P2P 횟수는 송신+수신 참여 횟수이고 Master는 송신 보고 기준 이전 이벤트 수이다.
+Worker의 장애 재할당 수는 해당 Worker의 처리 실패 수이다. Master는 연결 해제 재할당도 합산한다.
+Master 최종 로그에는 전체 KV 5,000쌍과 전체·Worker별 통계가 포함된다(정상 완료 기준).
+Master.txt는 서버 실행 폴더에 기록되며 원격 실행 시 Worker1이 요청하여 로컬로 받는다.
+Worker1.txt~Worker4.txt는 Java의 작업 폴더에 기록된다. 편의 실행의 보관 위치는 4-4를 참조한다.
 
-1) Worker는 각 작업을 80% 성공, 20% 실패 확률로 처리한다.
-2) 실패 시 RESULT FAIL 메시지로 Master에 보고한다.
-3) Master는 실패 작업을 Priority Retry Queue에 등록하고 장애 재할당 횟수를 증가시킨다.
-4) Master는 다음 배정 시 재시도 작업을 최우선으로 선택하고 직전 실패 Worker를 제외한다.
-5) 재할당 작업도 동일한 80% 성공, 20% 실패 규칙을 적용한다.
-6) 성공 결과가 수신될 때까지 위 과정을 반복한다.
-7) Worker Queue 초과 거부도 FAIL 결과로 보고하여 Master 재할당 대상으로 처리한다.
-8) Master는 taskId와 attempt 조합으로 중복 결과를 제거하고, 고유 taskId 5,000개와 KV 저장소 5,000개가 모두 확인될 때만 종료한다.
-9) Worker 연결이 끊어지면 Master가 해당 Worker의 미완료 작업을 우선 재시도 Queue로 복구한다.
+10. 추가 구현 사항 및 제약
 
-9. 가상 시간, 로그, 종료
+- 공통 Java 도우미로 Windows/Linux/macOS에 같은 출력 선택·진행 표시·로그 보관·요약 기능 제공.
+- 상세 출력 여부와 관계없이 노드별 로그와 전체 console.txt를 보존한다.
+- summary.txt는 Worker별 통계, Master P2P/재할당, 실제/가상 시간과 검증 상태를 표시한다.
+  COMPLETED: 로그 기준 고유 작업/KV 5,000개, 성공·실패 합계, 필수 통계와 종료 기록 확인.
+  PARTIAL: Worker 완료는 확인했으나 Master 로그 누락 또는 검증 불일치.
+  FAILED: 프로세스/연결/종료 오류나 Worker 완료 조건 미충족.
+  종료 코드는 COMPLETED/PARTIAL 0, FAILED 1이다. PARTIAL은 전체 정상 완료 확인이 아니다.
+- 이 검증은 로그 기반이며 모든 분산 장애 상황의 정확성을 보장하지 않는다.
+- 잘못된 프로토콜 필드·범위는 PROTO WARN으로 기록한다. 동일 transferId 중복 삽입을 방지한다.
+- 같은 PC의 동시 실행은 P2P 포트가 충돌한다. 여러 PC가 같은 Master를 동시에 공유하는
+  실행별 세션 분리도 지원하지 않으므로 한 번에 한 팀원이 실행한다.
+- Windows와 Linux(WSL)에서 실행 도구를 검증했다. WSL에서 기본·상세 출력 및 실행별 로그 보관을
+  확인했으며 기본 모드 AWS 연동 5,000건 완료를 확인했다. macOS 직접 검증은 미실시이다.
+  이번 P2P 상태 확인 수정본은 로컬 검증 완료이며 최종 AWS/WSL 재검증은 별도로 수행한다.
 
-- Master가 하나의 가상 시계를 관리하며 실제 Thread.sleep은 사용하지 않는다.
-- 작업 처리 시 1~3초, 노드 간 단방향 메시지 전송 시 1초를 가상 시계에 더한다.
-- 요청과 응답은 각각 한 번의 전송으로 계산한다.
-- Worker 간 통신은 Worker가 Master에 간단히 보고하여 시간을 반영한다. 시각 동기화와 종료 후 로그 전송은 수행시간에서 제외한다.
-- TCP 텍스트 인코딩: 모든 Master-Worker 및 Worker-Worker 통신에 UTF-8 명시
-- 네트워크 제한시간: 최초 Worker 연결은 제한 없이 대기, P2P ACK 5초, 정상 종료 ACK 30초
-- Master 로그 위치: EC2 Master 실행 폴더의 Master.txt. 원격 Master 연결의 종료 단계에서 Worker1이 요청, 수신하여 Worker 로그가 저장되는 위치에 저장된다.
-- Worker 로그 위치: Java 직접 실행은 현재 작업 폴더, 자동 실행 스크립트는 프로젝트 폴더의 Worker1.txt~Worker4.txt.
-  스크립트 종료 후 logs/<실행 ID>/에 복사하며 프로젝트 폴더의 이번 로그도 유지한다.
-- 로그 형식: [clock] NODE | EVENT | STATUS | message
-- Worker 로그: INIT, CONNECT, RECV, PROC, QUEUE, LB 이벤트와 필수 6개 성능 지표 기록
-- Master 로그: KV 생성, 배정, 결과, 재시도, P2P KV 번호, 최종 Key-Value 5,000쌍, 총 성공·실패, Queue 거부, 전체 합계와 Worker별 통계 기록
-- Worker 최종 STAT 필수 지표: 작업 처리량, 성공·실패 횟수, 평균 대기시간,
-  P2P 부하 분산 이벤트 횟수, 장애 재할당 횟수, 전체 수행시간
-- 종료 조건: 고유 KV 5,000개 성공 처리 완료. 성공 완료 뒤의 중복 재시도 항목은 종료 시 폐기
-- 종료 절차: Master TERMINATE 전송, Worker 최종 통계 및 TERMINATE_ACK 전송, Master 최종 통계 기록
-- 정상 종료 판정: Master는 처리 제한시간 내 고유 작업/KV 5,000개 완료와 종료 ACK 4개 수신을 모두 확인한다.
-  제한시간 초과 시 통계는 보존하되 최종 TERMINATE는 FAIL로 기록한다.
-  Worker는 TERMINATE와 FINAL_CLOCK 수신을 확인해야 SUCCESS로 기록하며, 최종 시각 대기 초과·중단은 FAIL이다.
-
-10. 추가 구현 사항
-
-- 고유 4자리 16진수 Key 생성, Value 범위 1~100
-- Worker Ready Queue 최대 10개 제한
-- Queue의 실제 작업 수가 변경 전 또는 후에 7을 초과하면 작업마다 WARN 기록(7→8, 8→7 포함).
-  P2P 묶음 송수신·실패 복원·종료 정리에도 적용하며, 전후 크기와 작업 ID·사유를 기록한다.
-  복원 예약 슬롯은 용량 제한에만 포함하고 WARN 크기에서는 제외한다.
-- Master와 Worker에 작업 처리량, 성공·실패 횟수, 평균 대기시간, P2P 부하 분산 이벤트 횟수, 장애 재할당 횟수, 전체 수행시간 기록
-- AllDefinedLogs.txt의 전체 로그 이벤트 명세 제공
-- 잘못된 필드 수·숫자·Worker ID·Task 직렬화 문자열을 PROTO WARN으로 거부
-- P2P transferId 기반 중복 수신 방지
+제출 구성 안내
+- 전체 소스(src/, launcher/, 필요 시 tests/), AllDefinedLogs.txt, 같은 실행의 로그 5개,
+  Readme.txt, download.txt(5분 이내 시연 영상 다운로드 링크)를 포함한다.
+- 편의 실행도 제공하려면 두 JAR와 run-workers.cmd/.ps1/.sh를 함께 포함한다.
+- 저장소 README.txt는 제출 ZIP에서 Readme.txt로 이름을 맞춘다. 별도 내용의 복사본은 관리하지 않는다.
+- out/, launcher-out/, .tmp.ux-check/, 과거 logs/, temp/, 개발용 테스트 산출물은 제출에서 제외한다.
+- 서버 개인키와 관리자 접속 자료는 제출물에 포함하지 않는다.
+- 영상 링크·공유 권한·재생 및 ZIP 압축 해제를 확인하고 조별 1명이 최종 제출한다.

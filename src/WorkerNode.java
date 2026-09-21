@@ -33,6 +33,10 @@ class WorkerNode implements Runnable {
     private final int masterPort;
     private final int peerPort;
     private final Object queueLock = new Object();
+    private final Object loadBalanceLock = new Object();
+    private final Set<String> unresolvedTransfers = ConcurrentHashMap.newKeySet();
+    private final Set<String> rejectedTransferIds = ConcurrentHashMap.newKeySet();
+    private enum TransferState { ACCEPTED, NOT_FOUND, REJECTED, UNKNOWN }
     private final Deque<Task> queue = new ArrayDeque<>();
     private final Map<String, PendingResult> pendingResults = new ConcurrentHashMap<>();
     private final Set<String> acceptedTransferIds = ConcurrentHashMap.newKeySet();
@@ -364,7 +368,11 @@ class WorkerNode implements Runnable {
     }
 
     // P2P 부하 분산 조건 확인
-    private synchronized void checkLoadBalance() {
+    private void checkLoadBalance() {
+        synchronized (loadBalanceLock) { checkLoadBalanceLocked(); }
+    }
+
+    private void checkLoadBalanceLocked() {
         long now = masterClockMillis;
         if (now < nextLoadCheck) return;
         nextLoadCheck = now + ThreadLocalRandom.current().nextLong(1_000, 3_001);
@@ -397,26 +405,52 @@ class WorkerNode implements Runnable {
 
         int target = targetLoad[0];
         String transferId = id + "-" + (++transferSequence);
-        if (transfer(target, transferId, batch)) {
-            synchronized (queueLock) {
-                reservedTransferSlots -= batch.size();
-            }
+        TransferState state = transfer(target, transferId, batch);
+        if (state == TransferState.UNKNOWN) {
+            unresolvedTransfers.add(transferId);
+            write("LB", "WARN", "전송ID=" + transferId + " 소유권 확인 보류, 예약 유지·복원 금지");
+            Thread resolver = new Thread(() -> {
+                while (!stopping) {
+                    TransferState confirmed = queryTransferStatus(target, transferId);
+                    if (confirmed != TransferState.UNKNOWN) {
+                        synchronized (loadBalanceLock) {
+                            if (!stopping) {
+                                finishTransfer(target, transferId, batch, confirmed);
+                                unresolvedTransfers.remove(transferId);
+                            }
+                        }
+                        return;
+                    }
+                    // Real backoff for unavailable peer, not simulated processing time.
+                    try { new CountDownLatch(1).await(1, TimeUnit.SECONDS); }
+                    catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+                }
+            }, "worker-transfer-status-" + transferId);
+            resolver.setDaemon(true);
+            resolver.start();
+        } else {
+            finishTransfer(target, transferId, batch, state);
+        }
+    }
+
+    private void finishTransfer(int target, String transferId, List<Task> batch, TransferState state) {
+        if (state == TransferState.UNKNOWN) throw new IllegalArgumentException("확인되지 않은 이전");
+        if (state == TransferState.ACCEPTED) {
+            synchronized (queueLock) { reservedTransferSlots -= batch.size(); }
             p2pSent += batch.size();
             p2pSentEvents++;
-            sendMaster("P2P|SENT|" + target + "|" + transferId + "|" + batch.size()
-                    + "|" + taskRefs(batch));
-            write("LB", "INFO", "예상 대기=" + format(estimatedWait)
-                    + "초, 조회ID=" + requestId + ", 최소 Queue 워커" + target
-                    + "(" + targetLoad[1] + "/10)로 " + batch.size() + "건 이전 요청");
-            int remaining = queueSize();
-            sendMaster("STATUS|" + remaining);
+            sendMaster("P2P|SENT|" + target + "|" + transferId + "|" + batch.size() + "|" + taskRefs(batch));
+            write("LB", "INFO", "전송ID=" + transferId + " ACCEPTED 확인, 복원 없이 이전 완료");
         } else {
             synchronized (queueLock) {
-                for (int index = batch.size() - 1; index >= 0; index--) addTaskLocked(batch.get(index), false, "P2P 실패 복원");
+                for (int index = batch.size() - 1; index >= 0; index--)
+                    addTaskLocked(batch.get(index), false, "P2P 실패 복원");
                 reservedTransferSlots -= batch.size();
                 queueLock.notifyAll();
             }
+            write("LB", "INFO", "전송ID=" + transferId + " " + state + " 확인, 작업 복원");
         }
+        sendMaster("STATUS|" + queueSize());
     }
 
     // 다른 Worker의 Queue를 조회해 가장 여유 있는 대상을 선택
@@ -467,8 +501,8 @@ class WorkerNode implements Runnable {
     }
 
     // 인접 Worker 작업 이전 요청
-    private boolean transfer(int target, String transferId, List<Task> batch) {
-        if (batch.isEmpty()) return false;
+    private TransferState transfer(int target, String transferId, List<Task> batch) {
+        if (batch.isEmpty()) return TransferState.REJECTED;
         StringBuilder data = new StringBuilder();
         for (Task task : batch) {
             if (data.length() > 0) data.append(';');
@@ -491,8 +525,8 @@ class WorkerNode implements Runnable {
                                 ? "TRANSFER_ACK" : "TRANSFER_REJECT";
                         reportPeerMessage(responseType, target, id);
                     }
-                    if (("ACK|" + transferId).equals(response)) return true;
-                    if (response != null && response.startsWith("REJECT|")) return false;
+                    if (("ACK|" + transferId).equals(response)) return TransferState.ACCEPTED;
+                    if (response != null && response.startsWith("REJECT|")) break;
                 }
             } catch (IOException e) {
                 if (attempt == 1) {
@@ -500,7 +534,26 @@ class WorkerNode implements Runnable {
                 }
             }
         }
-        return false;
+        return queryTransferStatus(target, transferId);
+    }
+
+    // NOT_FOUND is a cancellation decision: receiver fences any later TRANSFER with this ID.
+    private TransferState queryTransferStatus(int target, String transferId) {
+        try (Socket peer = new Socket()) {
+            peer.connect(new InetSocketAddress("127.0.0.1", 6000 + target), P2P_TIMEOUT_MILLIS);
+            peer.setSoTimeout(P2P_TIMEOUT_MILLIS);
+            try (BufferedReader in = new BufferedReader(new InputStreamReader(peer.getInputStream(), StandardCharsets.UTF_8));
+                 PrintWriter out = new PrintWriter(new OutputStreamWriter(peer.getOutputStream(), StandardCharsets.UTF_8), true)) {
+                reportPeerMessage("TRANSFER_STATUS", id, target);
+                out.println("TRANSFER_STATUS|" + transferId + "|" + id);
+                String response = in.readLine();
+                if (response == null) return TransferState.UNKNOWN;
+                reportPeerMessage("TRANSFER_STATE", target, id);
+                String[] p = response.split("\\|", -1);
+                if (p.length != 3 || !"TRANSFER_STATE".equals(p[0]) || !transferId.equals(p[1])) return TransferState.UNKNOWN;
+                return TransferState.valueOf(p[2]);
+            }
+        } catch (IOException | IllegalArgumentException e) { return TransferState.UNKNOWN; }
     }
 
     // P2P 작업 수신 서버 시작
@@ -531,6 +584,21 @@ class WorkerNode implements Runnable {
                                         + "|" + queueSize());
                                 continue;
                             }
+                            if (p.length == 3 && "TRANSFER_STATUS".equals(p[0])) {
+                                int source = Integer.parseInt(p[2]);
+                                validateTransferId(p[1], source);
+                                TransferState state;
+                                synchronized (queueLock) {
+                                    if (acceptedTransferIds.contains(p[1])) state = TransferState.ACCEPTED;
+                                    else if (rejectedTransferIds.contains(p[1])) state = TransferState.REJECTED;
+                                    else {
+                                        rejectedTransferIds.add(p[1]);
+                                        state = TransferState.NOT_FOUND;
+                                    }
+                                }
+                                out.println("TRANSFER_STATE|" + p[1] + "|" + state);
+                                continue;
+                            }
                             requireLength(p, 4);
                             if (!"TRANSFER".equals(p[0]) || p[1].isBlank()) {
                                 throw new IllegalArgumentException("TRANSFER 형식 오류");
@@ -540,8 +608,13 @@ class WorkerNode implements Runnable {
                             if (sourceId < 1 || sourceId > 4 || sourceId == id) {
                                 throw new IllegalArgumentException("송신 Worker 번호 오류");
                             }
+                            validateTransferId(transferId, sourceId);
                             if (acceptedTransferIds.contains(transferId)) {
                                 out.println("ACK|" + transferId);
+                                continue;
+                            }
+                            if (rejectedTransferIds.contains(transferId)) {
+                                out.println("REJECT|이전 취소 확정");
                                 continue;
                             }
                             String[] encoded = p[3].split(";");
@@ -563,6 +636,8 @@ class WorkerNode implements Runnable {
                                         if (task.retry) retryReceived++;
                                     }
                                     queueLock.notifyAll();
+                                } else {
+                                    rejectedTransferIds.add(transferId);
                                 }
                             }
                             if (accepted) {
@@ -594,6 +669,11 @@ class WorkerNode implements Runnable {
         }, "worker-peer-listener-" + id);
         peerThread.setDaemon(true);
         peerThread.start();
+    }
+
+    private void validateTransferId(String transferId, int source) {
+        if (source < 1 || source > 4 || source == id || !transferId.matches(source + "-[1-9][0-9]*"))
+            throw new IllegalArgumentException("이전 ID/송신 Worker 오류");
     }
 
     // 현재 Queue 크기 반환
@@ -660,8 +740,8 @@ class WorkerNode implements Runnable {
                 + (p2pSentEvents + p2pReceivedEvents));
         write("STAT", "INFO", "장애 재할당 횟수: " + fail);
         write("STAT", "INFO", "전체 수행 시간: " + VirtualClock.format(masterClockMillis) + "초");
-        write("TERMINATE", terminationConfirmed ? "SUCCESS" : "FAIL",
-                "워커" + id + (terminationConfirmed ? " 정상 연결 해제" : " 불완전 종료: 정상 종료 확인 실패"));
+        write("TERMINATE", terminationConfirmed && unresolvedTransfers.isEmpty() ? "SUCCESS" : "FAIL",
+                "워커" + id + (terminationConfirmed && unresolvedTransfers.isEmpty() ? " 정상 연결 해제" : " 불완전 종료: 정상 종료 또는 P2P 소유권 확인 실패"));
     }
 
     // Worker 로그 출력

@@ -32,6 +32,10 @@
   RESULT 로그는 20% 처리 실패와 Queue 초과 거부를 구분한다.
   동일 taskId와 attempt의 중복 RESULT는 최초 1건만 반영한다.
   P2P 전송은 transferId로 중복 수신을 방지한다.
+  LB INFO는 상태 확인 후 ACCEPTED 이전 확정 또는 NOT_FOUND/REJECTED 복원을 기록한다.
+  LB WARN의 소유권 확인 보류는 조회 실패로 예약을 유지하고 복원을 금지한 상태이다.
+  미확정 이전이 종료 시 남으면 Worker는 TERMINATE FAIL을 기록한다.
+  NET의 TRANSFER_STATUS/TRANSFER_STATE는 상태 확인 요청/응답의 단방향 지연이다.
   Master 통계에는 처리 실패 수와 Queue 초과 거부 수를 별도로 기록한다.
   장애 재할당 수는 20% 처리 실패와 Worker 연결 해제로 인한 재할당만 집계한다.
   Worker별 작업 처리량은 해당 Worker가 성공적으로 처리한 KV 쌍의 수로 기록한다.
